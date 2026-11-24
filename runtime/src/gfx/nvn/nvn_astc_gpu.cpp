@@ -1841,7 +1841,7 @@ void astc_gpu_pump(Frame& f) {
     const CpuTimer timer;
     tick_present();
     const bool async = async_on();
-    if (async) async_land(f);
+    if (s.async_sem) async_land(f);   // also after a failed submission turned it off: what is in flight still lands
     while (!s.q.empty()) {
         Work& w = s.q.front();
         Texture* t = w.t.get();
