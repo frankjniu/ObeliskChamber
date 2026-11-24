@@ -107,6 +107,10 @@ struct Frame {
 bool split_submission(Frame& f);
 uint64_t split_count();   // command buffers handed over early so far
 
+// [gfx] async_compute: the submission f belongs to reads what the async queue wrote up to timeline value `value` of `sem` (one semaphore);
+// its vkQueueSubmit2 waits for it. The highest value asked for wins.
+void frame_wait_async(Frame& f, VkSemaphore sem, uint64_t value);
+
 // Destruction: fn runs once every submission made so far (and the one being recorded) has completed.
 void defer_destroy(std::function<void()> fn);
 // The same for a closure that only calls Vulkan / VMA destroy functions (and atomic gauges) on objects nothing else refers to any more: with

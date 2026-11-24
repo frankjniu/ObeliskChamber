@@ -210,6 +210,10 @@ public:
     VkQueue queue() const { return queue_; }
     uint32_t queue_family() const { return queue_family_; }
     std::mutex& queue_mutex() { return queue_mutex_; }              // hold while calling vkQueueSubmit / vkQueuePresentKHR
+    // [gfx] async_compute: a second queue of the graphics family for background GPU work (the ASTC transcodes); null when off or the
+    // family has no queue to spare. Same family, so no ownership transfers are needed between it and queue().
+    VkQueue async_queue() const { return async_queue_; }
+    std::mutex& async_queue_mutex() { return async_queue_mutex_; }  // hold while calling vkQueueSubmit2 on async_queue()
     VmaAllocator allocator() const { return vma_; }
     VkSurfaceKHR surface() const { return surface_; }              // null when headless
     bool headless() const { return surface_ == VK_NULL_HANDLE; }
@@ -298,6 +302,8 @@ private:
     uint32_t queue_family_ = 0;
     uint32_t timestamp_valid_bits_ = 0;
     std::mutex queue_mutex_;
+    VkQueue async_queue_ = VK_NULL_HANDLE;
+    std::mutex async_queue_mutex_;
     VmaAllocator vma_ = nullptr;
     VkPhysicalDeviceProperties props_ = {};
     DeviceFeatures features_;

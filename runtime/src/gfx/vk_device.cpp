@@ -1037,11 +1037,31 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
         vkGetPhysicalDeviceQueueFamilyProperties(physical_, &nfam, fams.data());
         if (queue_family_ < nfam) fg_queues = extras::ffx_fg_extra_queues(fams[queue_family_].queueCount);
     }
-    const float prio[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    // [gfx] async_compute (auto: on when the graphics family has a queue to spare, not on Intel): one more queue of the family for background
+    // GPU work, at a lower priority than the frame's (the ASTC transcodes after a load, nvn_astc_gpu.cpp). Same family: buffers and images
+    // need no ownership transfer between the two.
+    uint32_t async_index = 0;
+    if (!headless) {
+        uint32_t nfam = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(physical_, &nfam, nullptr);
+        std::vector<VkQueueFamilyProperties> fams(nfam);
+        vkGetPhysicalDeviceQueueFamilyProperties(physical_, &nfam, fams.data());
+        std::string ac = config_get_str("gfx", "async_compute", "auto");
+        std::transform(ac.begin(), ac.end(), ac.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        const bool want = ac == "on" || ac == "true" || ac == "1" || (ac == "auto" && props_.vendorID != 0x8086);
+        if (want && queue_family_ < nfam) {
+            if (fams[queue_family_].queueCount > 1 + fg_queues) async_index = 1 + fg_queues;
+            else NXLOG_I(kTag, "async compute: off (the graphics family has %u queue(s), none to spare)", fams[queue_family_].queueCount);
+        }
+    }
+    const float prio[8] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+    float qprio[8];
+    for (int i = 0; i < 8; ++i) qprio[i] = prio[i];
+    if (async_index) qprio[async_index] = 0.5f;
     VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qci.queueFamilyIndex = queue_family_;
-    qci.queueCount = 1 + fg_queues;
-    qci.pQueuePriorities = prio;
+    qci.queueCount = 1 + fg_queues + (async_index ? 1 : 0);
+    qci.pQueuePriorities = qprio;
     VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &en};
     // Video memory (VK_EXT_memory_budget is enabled above, with the priority and pageable extensions).
     // AMD's driver refuses an allocation that takes this process past the size of a heap (VK_ERROR_OUT_OF_DEVICE_MEMORY) where other
@@ -1095,6 +1115,10 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
         nxrt::mem::limits_note_video_heap(largest);
     }
     vkGetDeviceQueue(device_, queue_family_, 0, &queue_);
+    if (async_index) {
+        vkGetDeviceQueue(device_, queue_family_, async_index, &async_queue_);
+        NXLOG_I(kTag, "async compute: queue %u of family %u ([gfx] async_compute)", async_index, queue_family_);
+    }
     if (fg_queues) extras::ffx_fg_install(*this, fg_queues);
 
     uint32_t nq = 0;

@@ -90,6 +90,10 @@ struct Slot {
     uint64_t frame = 0;                   // [prof] gpu_stats: presents counted when the submission was recorded (the frame it belongs to)
     // split_submission: command buffers of this slot's pool already handed to the GPU in this submission, and free ones (all reset with the pool)
     std::vector<VkCommandBuffer> split_used, split_free;
+    // [gfx] async_compute: the async queue's timeline value this submission's commands read the results of (0: none). Its vkQueueSubmit2
+    // waits for it (nvn_astc_gpu.cpp lands a transcode only once the value is reached, so the wait is for memory visibility, not time).
+    VkSemaphore wait_sem = VK_NULL_HANDLE;
+    uint64_t wait_value = 0;
 };
 
 // [prof] gpu_stats = N: every N frames one log line (nvn.gpustats) with the GPU time per frame (the sum of each submission's first-to-last
@@ -454,6 +458,17 @@ void flush_batch() {
     si.pCommandBufferInfos = cbi.data();
     si.signalSemaphoreInfoCount = 1;
     si.pSignalSemaphoreInfos = &sig;
+    VkSemaphoreSubmitInfo wait = {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
+    for (Slot* b : g->batch)
+        if (b->wait_value > wait.value) {
+            wait.semaphore = b->wait_sem;
+            wait.value = b->wait_value;
+        }
+    if (wait.value) {
+        wait.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        si.waitSemaphoreInfoCount = 1;
+        si.pWaitSemaphoreInfos = &wait;
+    }
     VkResult r;
     {
         nxrt::HitchTimer ht(nxrt::kHpRenderSubmit);
@@ -510,6 +525,14 @@ bool split_submission(Frame& f) {
     VkSubmitInfo2 si = {VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
     si.commandBufferInfoCount = 1;
     si.pCommandBufferInfos = &cbi;
+    VkSemaphoreSubmitInfo wait = {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
+    if (s.wait_value) {               // (kept on the slot: the last part's submission waits again, which costs nothing)
+        wait.semaphore = s.wait_sem;
+        wait.value = s.wait_value;
+        wait.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        si.waitSemaphoreInfoCount = 1;
+        si.pWaitSemaphoreInfos = &wait;
+    }
     VkResult r;
     {
         NXFT("split.submit");
@@ -539,6 +562,15 @@ bool split_submission(Frame& f) {
 }
 
 uint64_t split_count() { return g_splits.load(std::memory_order_relaxed); }
+
+void frame_wait_async(Frame& f, VkSemaphore sem, uint64_t value) {
+    if (!f.slot || !sem || !value) return;
+    Slot& s = *static_cast<Slot*>(f.slot);
+    if (value > s.wait_value) {
+        s.wait_sem = sem;
+        s.wait_value = value;
+    }
+}
 
 namespace {
 
@@ -740,6 +772,8 @@ Slot& acquire_slot() {
     s.gp_labels.clear();
     retire();
     vkResetCommandPool(g->dev->device(), s.pool, 0);
+    s.wait_sem = VK_NULL_HANDLE;
+    s.wait_value = 0;
     if (!s.split_used.empty()) {     // the reset made them free again; the slot's own cb is whichever was current at the end
         s.split_free.insert(s.split_free.end(), s.split_used.begin(), s.split_used.end());
         s.split_used.clear();
@@ -1346,6 +1380,11 @@ bool take_batch_for_present(std::vector<VkCommandBuffer>* cmds, gfx::Renderer::S
     p->count = static_cast<uint32_t>(cmds->size());
     p->timeline = g->timeline;
     p->value = g->batch.back()->serial;
+    for (Slot* s : g->batch)         // [gfx] async_compute: the batched branch has the wait free for it
+        if (s->wait_value > p->wait_value) {
+            p->wait = s->wait_sem;
+            p->wait_value = s->wait_value;
+        }
     return true;
 }
 

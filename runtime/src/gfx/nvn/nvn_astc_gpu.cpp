@@ -105,7 +105,38 @@ struct Work {
     gfx::Buffer rb;                   // ... through this buffer, filled pass by pass
     VkDeviceSize rb_off = 0;
     uint32_t queued_present = 0;      // the present it was queued in (its stand-in is first shown at the end of that one)
+    uint64_t async_value = 0;         // [gfx] async_compute: the last async pass that reads `staged` or writes `rb` (async timeline value)
 };
+
+// [gfx] async_compute: a queued pass run on the device's async queue. Its decode and encode run there, with a scratch of its own, and the
+// result goes to `out`; a later present, once the async timeline has reached `value`, copies `out` into the image on the frame's queue
+// (the submission waits for the value too). The frame's own work no longer waits behind the transcodes of a load.
+struct AsyncCtx {
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    VkDescriptorPool dpool = VK_NULL_HANDLE;
+    VkDescriptorSet dec = VK_NULL_HANDLE, enc = VK_NULL_HANDLE;
+    Scratch sc;
+    bool sets_ok = false;             // dec / enc describe sc
+    gfx::Buffer out;                  // the encoded blocks (or RGBA8 texels) of every chunk, back to back
+    gfx::Buffer src;                  // the ASTC blocks when the job had no upload buffer of its own (else the Work's `staged`)
+    std::vector<VkBufferImageCopy> copies;
+    enum St { Free, Launched, Landed } st = Free;
+    uint64_t value = 0;               // async timeline value the pass signals
+    uint64_t free_at = 0;             // Landed: reusable once the frame queue's serial reaches this (its copy out of `out` is done)
+    // what the landing needs
+    Ref<Texture> t;
+    uint32_t gen = 0;
+    const void* image = nullptr;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    bool last = false;
+    int slot = -1;
+    uint64_t texels = 0;
+    gfx::Buffer store_rb;
+    PreparedTexture meta;
+    gfx::Buffer staged;               // the Work's upload buffer after its last pass: freed after the landing
+};
+constexpr size_t kAsyncCtx = 3;
 
 struct StoreItem {
     gfx::Buffer rb;
@@ -176,6 +207,14 @@ struct State {
     uint64_t n_waited = 0, cpu_ns = 0;   // cpu_ns: render-thread time spent in astc_gpu_upload and astc_gpu_pump
     uint64_t logged_tex = 0, last_log_ns = 0;
     std::atomic<uint64_t> stored{0}, store_failed{0}, readback_bytes{0};
+    // ---- [gfx] async_compute (render thread) ----
+    int async = -1;                   // -1 not tried, 0 off, 1 on
+    VkSemaphore async_sem = VK_NULL_HANDLE;
+    uint64_t async_next = 0;          // last value handed out
+    std::deque<AsyncCtx> actx;
+    std::deque<std::pair<uint64_t, gfx::Buffer>> async_garbage;   // buffers an async pass may still use: freed once its value is reached
+    uint64_t n_async = 0, n_async_landed = 0;
+    uint32_t async_used_at = 0;       // present count of the last async launch
     // ---- cache writer ----
     std::mutex wmu;
     std::condition_variable wcv;
@@ -989,6 +1028,9 @@ void log_stats(bool force) {
             static_cast<unsigned long long>(s.n_stale), static_cast<unsigned long long>(s.n_load_windows), static_cast<unsigned long long>(s.play_capped), static_cast<unsigned long long>(s.stored.load()), static_cast<unsigned long long>(s.store_failed.load()),
             static_cast<unsigned long long>(s.n_failed), static_cast<double>(s.max_present_texels) / 1e6, s.max_present_ms, s.win.n,
             s.win.median() > 0.0 ? 1e6 / s.win.median() : 0.0, s.win.quarter_ms());
+    if (s.n_async)
+        NXLOG_I(kTag, "of the queued passes, %llu ran on the async queue ([gfx] async_compute), %llu landed", static_cast<unsigned long long>(s.n_async),
+                static_cast<unsigned long long>(s.n_async_landed));
 }
 
 struct CpuTimer {
@@ -998,7 +1040,9 @@ struct CpuTimer {
 
 void update_work() {
     State& s = S();
-    s.work.store(static_cast<uint32_t>(s.q.size()) + (s.sc.buf ? 1u : 0u), std::memory_order_relaxed);
+    uint32_t inflight = 0;
+    for (const AsyncCtx& c : s.actx) inflight += c.st != AsyncCtx::Free ? 1u : 0u;
+    s.work.store(static_cast<uint32_t>(s.q.size()) + (s.sc.buf ? 1u : 0u) + inflight + (s.async_garbage.empty() ? 0u : 1u), std::memory_order_relaxed);
 }
 
 // ---- the budget ---------------------------------------------------------------------------------------------------------------
@@ -1153,17 +1197,32 @@ bool build_work(Texture* t, PreparedTexture& prep, gfx::Buffer& staged, Work& w)
     return true;
 }
 
+uint64_t async_done_value() {
+    State& s = S();
+    uint64_t v = 0;
+    if (s.async_sem) vkGetSemaphoreCounterValue(vkdev(), s.async_sem, &v);
+    return v;
+}
+
+// A buffer commands may still use: freed after the frame queue's submissions so far, and after async pass `async_value` (0: none).
+void retire_buffer(gfx::Buffer b, uint64_t async_value) {
+    State& s = S();
+    if (async_value && async_value > async_done_value()) {
+        s.async_garbage.emplace_back(async_value, b);
+        return;
+    }
+    defer_destroy_vk([b]() mutable { device().destroy_buffer(b); });
+}
+
 void drop_work(Work& w) {
     State& s = S();
     if (w.staged) {
-        gfx::Buffer b = w.staged;
-        defer_destroy_vk([b]() mutable { device().destroy_buffer(b); });   // commands recorded earlier may still read it
+        retire_buffer(w.staged, w.async_value);   // commands recorded earlier may still read it
         w.staged = gfx::Buffer{};
     }
     if (w.rb) {
-        gfx::Buffer b = w.rb;
-        s.readback_bytes.fetch_sub(b.size);
-        defer_destroy_vk([b]() mutable { device().destroy_buffer(b); });
+        s.readback_bytes.fetch_sub(w.rb.size);
+        retire_buffer(w.rb, w.async_value);
         w.rb = gfx::Buffer{};
     }
 }
@@ -1350,6 +1409,358 @@ Pass run_work(Work& w, Frame& f, bool budgeted) {
     return last ? Pass::Finished : Pass::More;
 }
 
+
+// ---- [gfx] async_compute -------------------------------------------------------------------------------------------------------
+bool async_on() {
+    State& s = S();
+    if (s.async >= 0) return s.async == 1;
+    s.async = 0;
+    gfx::Device& d = device();
+    if (!d.async_queue()) return false;
+    VkSemaphoreTypeCreateInfo ti = {VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+    ti.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    VkSemaphoreCreateInfo ci = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &ti};
+    if (vkCreateSemaphore(vkdev(), &ci, nullptr, &s.async_sem) != VK_SUCCESS) {
+        NXLOG_W(kTag, "async compute: no timeline semaphore: queued transcodes run on the frame's queue");
+        return false;
+    }
+    s.async_next = 0;
+    s.async = 1;
+    NXLOG_I(kTag, "queued ASTC transcodes run on the async queue ([gfx] async_compute)");
+    return true;
+}
+
+bool ctx_make(AsyncCtx& c) {
+    State& s = S();
+    const VkDevice d = vkdev();
+    VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    pci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    pci.queueFamilyIndex = device().queue_family();
+    if (vkCreateCommandPool(d, &pci, nullptr, &c.pool) != VK_SUCCESS) return false;
+    VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    ai.commandPool = c.pool;
+    ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    ai.commandBufferCount = 1;
+    if (vkAllocateCommandBuffers(d, &ai, &c.cb) != VK_SUCCESS) return false;
+    const VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4};
+    VkDescriptorPoolCreateInfo dpi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpi.maxSets = 2;
+    dpi.poolSizeCount = 1;
+    dpi.pPoolSizes = &ps;
+    if (vkCreateDescriptorPool(d, &dpi, nullptr, &c.dpool) != VK_SUCCESS) return false;
+    for (VkDescriptorSet* set : {&c.dec, &c.enc}) {
+        VkDescriptorSetAllocateInfo si = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        si.descriptorPool = c.dpool;
+        si.descriptorSetCount = 1;
+        si.pSetLayouts = &s.dsl;
+        if (vkAllocateDescriptorSets(d, &si, set) != VK_SUCCESS) return false;
+    }
+    return true;
+}
+
+void ctx_destroy(AsyncCtx& c) {
+    const VkDevice d = vkdev();
+    if (c.sc.buf) device().destroy_buffer(c.sc.buf);
+    if (c.out) device().destroy_buffer(c.out);
+    if (c.src) device().destroy_buffer(c.src);
+    if (c.staged) device().destroy_buffer(c.staged);
+    if (c.store_rb) {
+        S().readback_bytes.fetch_sub(c.store_rb.size);
+        device().destroy_buffer(c.store_rb);
+    }
+    if (c.dpool) vkDestroyDescriptorPool(d, c.dpool, nullptr);
+    if (c.pool) vkDestroyCommandPool(d, c.pool, nullptr);
+    c = AsyncCtx();
+}
+
+// A context whose last pass has landed and whose copy out of `out` the frame queue has run; made when there are fewer than kAsyncCtx.
+AsyncCtx* ctx_free() {
+    State& s = S();
+    const uint64_t done = poll_completed();
+    for (AsyncCtx& c : s.actx) {
+        if (c.st == AsyncCtx::Landed && c.free_at <= done) c.st = AsyncCtx::Free;
+        if (c.st == AsyncCtx::Free) return &c;
+    }
+    if (s.actx.size() >= kAsyncCtx) return nullptr;
+    s.actx.emplace_back();
+    if (!ctx_make(s.actx.back())) {
+        ctx_destroy(s.actx.back());
+        s.actx.pop_back();
+        return nullptr;
+    }
+    return &s.actx.back();
+}
+
+// run_work on the async queue: the same regions and budget, recorded into a context's command buffer and submitted there at once. The
+// copies into the image wait for async_land in a later present.
+Pass run_work_async(Work& w, Frame& f) {
+    State& s = S();
+    Texture* t = w.t.get();
+    AsyncCtx* cp = ctx_free();
+    if (!cp) return Pass::More;           // all contexts in flight: the next present
+    AsyncCtx& c = *cp;
+    Job j;
+    j.kind = w.j.kind;
+    j.bw = w.j.bw;
+    j.bh = w.j.bh;
+    j.srgb = w.j.srgb;
+    uint64_t texels = 0, src_bytes = 0, out_bytes = 0;
+    size_t end = w.next;
+    const double room = (s.cap_ms > 0.0 ? std::min(budget_now(), s.cap_ms) : budget_now()) - s.spent_ms;
+    for (; end < w.j.rg.size(); ++end) {
+        const Region& r = w.j.rg[end];
+        const uint64_t n = static_cast<uint64_t>(r.w) * r.h * r.slices;
+        if ((cost_ms(texels + n) > room || over_cap(texels + n)) && (end > w.next || s.spent_ms > 0.0)) break;
+        texels += n;
+        src_bytes += region_in(r, j.bw, j.bh);
+        out_bytes += j.kind == Kind::Rgba ? region_out(r) : region_bc(r, j.kind);
+        j.rg.push_back(r);
+    }
+    if (end == w.next) return Pass::More;
+    const bool last = end == w.j.rg.size();
+    const std::vector<Chunk> chunks = plan_chunks(j);
+    const gfx::Buffer before = c.sc.buf;
+    if (!scratch_fit(c.sc, chunks, [](gfx::Buffer old) { device().destroy_buffer(old); })) return Pass::Failed;   // (a free context's scratch is idle)
+    if (c.sc.buf.buffer != before.buffer || !c.sets_ok) {
+        write_sets(c.sc, c.dec, c.enc);
+        c.sets_ok = true;
+    }
+    const VkDeviceSize al = s.align;
+    out_bytes += al * chunks.size();      // each chunk's part starts aligned
+    if (!c.out || c.out.size < out_bytes) {
+        if (c.out) device().destroy_buffer(c.out);
+        c.out = gfx::Buffer{};
+        if (device().create_buffer(std::max<VkDeviceSize>(out_bytes, 4ull << 20), VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                   gfx::MemoryUse::GpuOnly, &c.out, "nvn astc async out") != VK_SUCCESS)
+            return Pass::Failed;
+    }
+    if (w.store && !w.rb && w.next == 0) {
+        uint64_t bytes = 0;
+        for (const Region& r : w.j.rg) bytes += region_bc(r, w.j.kind);
+        if (s.readback_bytes.load() + bytes > kReadbackMax ||
+            device().create_buffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, gfx::MemoryUse::Readback, &w.rb, "nvn astc readback") != VK_SUCCESS || !w.rb.mapped) {
+            if (w.rb) device().destroy_buffer(w.rb);
+            w.rb = gfx::Buffer{};
+            w.store = false;
+        } else {
+            s.readback_bytes.fetch_add(w.rb.size);
+        }
+    }
+    // the blocks: the job's upload buffer, or a buffer of the context's own (the frame's staging is freed with the frame, not the pass)
+    if (w.staged) {
+        j.src = w.staged.buffer;
+        j.src_base = 0;
+    } else {
+        if (!c.src || c.src.size < src_bytes) {
+            if (c.src) device().destroy_buffer(c.src);
+            c.src = gfx::Buffer{};
+            if (device().create_buffer(std::max<VkDeviceSize>(src_bytes, 1ull << 20), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, gfx::MemoryUse::Upload, &c.src,
+                                       "nvn astc async blocks") != VK_SUCCESS || !c.src.mapped)
+                return Pass::Failed;
+        }
+        uint64_t off = 0;
+        for (Region& r : j.rg) {
+            const uint64_t n = region_in(r, j.bw, j.bh);
+            std::memcpy(static_cast<uint8_t*>(c.src.mapped) + off, w.prep.data.data() + r.src, static_cast<size_t>(n));
+            r.src = off;
+            off += n;
+        }
+        j.src = c.src.buffer;
+        j.src_base = 0;
+    }
+    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkResetCommandPool(vkdev(), c.pool, 0);
+    vkBeginCommandBuffer(c.cb, &bi);
+    int slot = -1;
+    for (uint32_t i = 0; i < kTimeSlots; ++i)
+        if (!s.slot_busy[i]) { slot = static_cast<int>(i); break; }
+    if (slot >= 0) {
+        s.slot_busy[slot] = true;
+        vkCmdResetQueryPool(c.cb, s.qpool, static_cast<uint32_t>(slot) * 2, 2);
+        vkCmdWriteTimestamp2(c.cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, s.qpool, static_cast<uint32_t>(slot) * 2);
+    }
+    c.copies.clear();
+    VkDeviceSize out_at = 0;
+    const VkBuffer rb = w.rb.buffer;
+    VkDeviceSize rb_off = w.rb_off;
+    record(c.cb, c.sc, c.dec, c.enc, j, chunks, [&](const ChunkOut& co) {
+        // the chunk's part of the scratch into `out`: the next chunk reuses the scratch
+        const VkDeviceSize from = j.kind == Kind::Rgba ? co.texels : co.blocks;
+        const VkDeviceSize n = j.kind == Kind::Rgba ? co.texel_bytes : co.block_bytes;
+        const VkBufferCopy bc = {from, out_at, n};
+        vkCmdCopyBuffer(c.cb, co.buf, c.out.buffer, 1, &bc);
+        for (VkBufferImageCopy cp : co.copies) {
+            cp.bufferOffset = cp.bufferOffset - from + out_at;
+            c.copies.push_back(cp);
+        }
+        if (rb) {
+            const VkBufferCopy r = {co.blocks, rb_off, co.block_bytes};
+            vkCmdCopyBuffer(c.cb, co.buf, rb, 1, &r);
+            rb_off += co.block_bytes;
+        }
+        out_at = round_up(out_at + n, al);
+        // the copies read the scratch before the next chunk writes it (record's barrier at the chunk start covers transfers)
+    });
+    w.rb_off = rb_off;
+    if (slot >= 0) vkCmdWriteTimestamp2(c.cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, s.qpool, static_cast<uint32_t>(slot) * 2 + 1);
+    if (rb && last) barrier(c.cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
+    if (vkEndCommandBuffer(c.cb) != VK_SUCCESS) {
+        if (slot >= 0) s.slot_busy[slot] = false;
+        return Pass::Failed;
+    }
+    const uint64_t value = s.async_next + 1;
+    VkCommandBufferSubmitInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
+    cbi.commandBuffer = c.cb;
+    VkSemaphoreSubmitInfo sig = {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
+    sig.semaphore = s.async_sem;
+    sig.value = value;
+    sig.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    VkSubmitInfo2 si = {VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+    si.commandBufferInfoCount = 1;
+    si.pCommandBufferInfos = &cbi;
+    si.signalSemaphoreInfoCount = 1;
+    si.pSignalSemaphoreInfos = &sig;
+    VkResult r;
+    {
+        std::lock_guard<std::mutex> lk(device().async_queue_mutex());
+        r = vkQueueSubmit2(device().async_queue(), 1, &si, VK_NULL_HANDLE);
+    }
+    if (r != VK_SUCCESS) {
+        NXLOG_E(kTag, "async compute: vkQueueSubmit2 failed (%d): transcodes go back to the frame's queue", static_cast<int>(r));
+        if (slot >= 0) s.slot_busy[slot] = false;
+        s.async = 0;
+        return Pass::Failed;
+    }
+    s.async_next = value;
+    w.async_value = value;
+    c.st = AsyncCtx::Launched;
+    c.value = value;
+    c.t = w.t;
+    c.gen = w.gen;
+    c.image = w.image;
+    c.format = w.prep.format;
+    c.last = last;
+    c.slot = slot;
+    c.texels = texels;
+    if (last) {
+        if (w.rb) {
+            c.store_rb = w.rb;
+            w.rb = gfx::Buffer{};
+            c.meta.format = w.prep.format;
+            c.meta.levels = w.prep.levels;
+            c.meta.layers = w.prep.layers;
+            c.meta.block_w = w.prep.block_w;
+            c.meta.block_h = w.prep.block_h;
+            c.meta.block_bytes = w.prep.block_bytes;
+            c.meta.gpu_astc = true;
+            c.meta.gpu_cache_key = w.prep.gpu_cache_key;
+            c.meta.gpu_cache_file = w.prep.gpu_cache_file;
+            c.meta.level = w.prep.level;
+        }
+        if (w.staged) {
+            c.staged = w.staged;
+            w.staged = gfx::Buffer{};
+        }
+    }
+    w.next = end;
+    s.spent_ms += cost_ms(texels);
+    s.spent_texels += texels;
+    if (s.spent_texels > s.max_present_texels) {
+        s.max_present_texels = s.spent_texels;
+        s.max_present_ms = s.spent_ms;
+    }
+    s.n_texels += texels;
+    ++s.n_async;
+    s.async_used_at = presents_now();
+    (void)f;
+    return last ? Pass::Finished : Pass::More;
+}
+
+// Passes whose async work is done: their copies into the images go into f (whose submission waits for the async value as well), in the
+// order they were launched.
+void async_land(Frame& f) {
+    State& s = S();
+    if (s.actx.empty()) return;
+    const uint64_t done = async_done_value();
+    std::vector<AsyncCtx*> ready;
+    for (AsyncCtx& c : s.actx)
+        if (c.st == AsyncCtx::Launched && c.value <= done) ready.push_back(&c);
+    std::sort(ready.begin(), ready.end(), [](const AsyncCtx* a, const AsyncCtx* b) { return a->value < b->value; });
+    for (AsyncCtx* cp : ready) {
+        AsyncCtx& c = *cp;
+        Texture* t = c.t.get();
+        const bool live = t && !t->destroyed.load() && t->prep_gen.load(std::memory_order_acquire) == c.gen && tex_gpu_identity(t) == c.image &&
+                          tex_vk_format(t) == c.format;
+        bool copied = false;
+        if (live) {
+            copied = tex_copy_buffer_regions(t, f, c.out.buffer, c.copies);
+            frame_wait_async(f, s.async_sem, c.value);
+            if (!copied) {                // the CPU path takes it from here, as after a failed pass
+                ++s.n_failed;
+                t->cpu_dirty.store(true);
+                pool_note_cpu_write(t);
+            }
+        } else {
+            ++s.n_stale;
+        }
+        if (copied && c.last) {
+            ++s.n_tex;
+            g_transcodes.fetch_add(1, std::memory_order_relaxed);
+        }
+        ++s.n_async_landed;
+        const int slot = c.slot;
+        const uint64_t texels = c.texels;
+        const uint32_t tid = t ? t->id : 0;
+        gfx::Buffer store_rb = copied ? c.store_rb : gfx::Buffer{};
+        if (!copied && c.store_rb) {
+            s.readback_bytes.fetch_sub(c.store_rb.size);
+            gfx::Buffer b = c.store_rb;
+            defer_destroy_vk([b]() mutable { device().destroy_buffer(b); });
+        }
+        c.store_rb = gfx::Buffer{};
+        if (c.staged) {
+            f.adopt_staging(c.staged);    // freed when this submission has completed (the async work reading it is done)
+            c.staged = gfx::Buffer{};
+        }
+        PreparedTexture meta = std::move(c.meta);
+        c.meta = PreparedTexture();
+        c.t = nullptr;
+        c.st = AsyncCtx::Landed;
+        c.free_at = f.serial;
+        if (slot >= 0 || store_rb) {
+            f.defer([slot, store_rb, texels, tid, meta = std::move(meta)]() mutable {
+                State& s2 = S();
+                if (slot >= 0) {
+                    uint64_t r[4] = {};
+                    if (s2.qpool && vkGetQueryPoolResults(vkdev(), s2.qpool, static_cast<uint32_t>(slot) * 2, 2, sizeof r, r, 2 * sizeof(uint64_t),
+                                                          VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) == VK_SUCCESS && r[1] && r[3] && r[2] >= r[0]) {
+                        const double ms = static_cast<double>(r[2] - r[0]) * s2.ts_period_ns * 1e-6;
+                        if (ms < 60000.0) {
+                            ++s2.n_timed;
+                            s2.timed_texels += texels;
+                            s2.gpu_ms += ms;
+                            if (ms > s2.max_ms) {
+                                s2.max_ms = ms;
+                                if (ms > 4.0) NXLOG_I(kTag, "texture %u: an async pass of %.2f M texels took %.2f ms of GPU time (the longest so far)", tid,
+                                                      static_cast<double>(texels) / 1e6, ms);
+                            }
+                            // the rate and the hand-off are left to the frame-queue passes: an async pass shares the GPU with the frame by design
+                        }
+                    }
+                    s2.slot_busy[slot] = false;
+                }
+                if (store_rb) store_async(store_rb, std::move(meta));
+            });
+        }
+    }
+    // buffers async passes may have used: free once their value is reached
+    while (!s.async_garbage.empty() && s.async_garbage.front().first <= done) {
+        gfx::Buffer b = s.async_garbage.front().second;
+        defer_destroy_vk([b]() mutable { device().destroy_buffer(b); });
+        s.async_garbage.pop_front();
+    }
+}
 }  // namespace
 
 bool astc_gpu_enabled(bool wait) {
@@ -1429,6 +1840,8 @@ void astc_gpu_pump(Frame& f) {
     s.pump_at = now;
     const CpuTimer timer;
     tick_present();
+    const bool async = async_on();
+    if (async) async_land(f);
     while (!s.q.empty()) {
         Work& w = s.q.front();
         Texture* t = w.t.get();
@@ -1440,7 +1853,7 @@ void astc_gpu_pump(Frame& f) {
             continue;
         }
         // handed back to the CPU: what is still queued goes the CPU way too (as a failed pass)
-        const Pass p = s.handoff.load(std::memory_order_acquire) ? Pass::Failed : run_work(w, f, true);
+        const Pass p = s.handoff.load(std::memory_order_acquire) ? Pass::Failed : (async && s.async == 1) ? run_work_async(w, f) : run_work(w, f, true);
         if (p == Pass::More) break;        // the budget is used up
         if (p == Pass::Finished) {
             // how long its stand-in was on screen: from the first present that began after it was queued (the frame it was queued in showed it first)
@@ -1461,6 +1874,15 @@ void astc_gpu_pump(Frame& f) {
         }
         drop_work(w);
         s.q.pop_front();
+    }
+    if (s.q.empty() && !s.actx.empty() && now - s.async_used_at > kScratchIdlePresents) {   // the async contexts' buffers go back when idle
+        const uint64_t done = poll_completed();
+        bool idle = true;
+        for (const AsyncCtx& c : s.actx) idle = idle && (c.st == AsyncCtx::Free || (c.st == AsyncCtx::Landed && c.free_at <= done));
+        if (idle) {
+            for (AsyncCtx& c : s.actx) ctx_destroy(c);
+            s.actx.clear();
+        }
     }
     if (s.q.empty() && s.sc.buf && now - s.sc_used_at > kScratchIdlePresents) {
         gfx::Buffer old = s.sc.buf;
@@ -1495,6 +1917,13 @@ void astc_gpu_shutdown() {
         }
     }
     s.q.clear();
+    for (AsyncCtx& c : s.actx) ctx_destroy(c);   // (the device is idle, the async queue with it)
+    s.actx.clear();
+    for (auto& gb : s.async_garbage) device().destroy_buffer(gb.second);
+    s.async_garbage.clear();
+    if (s.async_sem) vkDestroySemaphore(vkdev(), s.async_sem, nullptr);
+    s.async_sem = VK_NULL_HANDLE;
+    s.async = -1;
     if (s.sc.buf) device().destroy_buffer(s.sc.buf);
     s.sc = Scratch();
     ++s.sc_gen;
