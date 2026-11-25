@@ -2327,28 +2327,35 @@ static bool tex_move_at(Texture* t, TexGpu* g, Frame& f, VmaAllocation dst, std:
 }
 
 // [gfx] defrag (auto: on with [gfx] kind_pools): at loading screens (the frame limiter's loading state, and [gfx] defrag_after_load_ms after
-// it, default 0: play is never touched), VMA's defragmentation of the texture pools runs one pass at a time: each pass moves at most
-// defrag_mb_per_pass MiB and defrag_moves_per_pass textures (tex_move_at), and ends once the GPU finished its copies, so that whole blocks
-// empty and go back to the driver. Textures that can't move now are left where they are (the move is ignored). It only runs once the free
-// space inside the texture pools' blocks is over defrag_high_pct % and defrag_high_mb MiB, and stops (until the high mark again) once
-// it is under defrag_low_pct %; at most defrag_passes_per_load passes a loading screen. One log line per loading screen that moved.
+// it, default 0: no new pass starts in play; one still open is finished in the first frames after), VMA's defragmentation of the texture
+// pools runs one pass at a time: each pass moves at most defrag_mb_per_pass MiB and defrag_moves_per_pass textures (tex_move_at), and
+// ends once the GPU finished its copies, so that whole blocks empty and go back to the driver. Textures that can't move now are left where
+// they are (the move is ignored). It only runs once what it could give back (Device::defrag_pool_bytes: blocks beyond what the
+// allocations need packed, less the empty block VMA keeps) is over defrag_high_pct % of the texture blocks and defrag_high_mb MiB, and
+// stops (until the high mark again) once that is under defrag_low_pct %; at most defrag_passes_per_load passes a loading screen (unpaced
+// stretches less than 1.5 s apart are one loading screen). One log line per loading screen that moved.
 // (The hour-long soak at every loading screen: ~0.3 GB less video memory, but 122,589 moves, slower loading-screen frames and a 4-6%
 // lower 1% low in the walk after each load from the passes after it.)
 void tex_defrag_tick(Frame& f) {
     if (!device().defrag_enabled()) return;
     struct State {
-        bool open = false, in_window = false, done = false;
+        bool open = false;
         uint64_t serial = 0;
         std::vector<gfx::Device::DefragMove> moves;
         std::vector<VkImage> old_images;
         std::vector<VkImageView> old_views;
-        uint32_t window_until = 0, started = 0;
-        int windows = 0;
-        bool armed = false;          // free space went over the high mark; until it is under the low mark
+        // a loading screen: from the first unpaced frame until kMergeMs (or defrag_after_load_ms, if longer) after the last, so a load
+        // whose pacing flips on and off between its parts is one loading screen with one pass budget, one check of the marks, one line
+        bool in_load = false, work_done = false;
+        uint32_t last_unpaced = 0, started = 0;
+        int loads = 0;
+        bool armed = false;          // reclaimable space went over the high mark; until it is under the low mark
         uint32_t passes = 0;         // passes in this loading screen
         uint64_t free_before = 0, block_before = 0;
+        const char* outcome = "";
     };
     static State st;
+    constexpr uint32_t kMergeMs = 1500;
     static const uint64_t max_bytes = static_cast<uint64_t>(std::clamp<int64_t>(nxrt::config_get_int("gfx", "defrag_mb_per_pass", 64), 1, 4096)) << 20;
     static const uint32_t max_moves = static_cast<uint32_t>(std::clamp<int64_t>(nxrt::config_get_int("gfx", "defrag_moves_per_pass", 256), 1, 65536));
     static const uint32_t after_ms = static_cast<uint32_t>(std::clamp<int64_t>(nxrt::config_get_int("gfx", "defrag_after_load_ms", 0), 0, 600000));
@@ -2356,30 +2363,41 @@ void tex_defrag_tick(Frame& f) {
     static const uint64_t high_bytes = static_cast<uint64_t>(std::clamp<int64_t>(nxrt::config_get_int("gfx", "defrag_high_mb", 128), 0, 65536)) << 20;
     static const uint64_t low_pct = static_cast<uint64_t>(std::clamp<int64_t>(nxrt::config_get_int("gfx", "defrag_low_pct", 5), 0, 100));
     static const uint32_t max_passes = static_cast<uint32_t>(std::clamp<int64_t>(nxrt::config_get_int("gfx", "defrag_passes_per_load", 4), 1, 100000));
-    auto pool_free = [](uint64_t* block) {
-        uint64_t b = 0, a = 0;
-        device().defrag_pool_bytes(&b, &a);
+    auto reclaimable = [](uint64_t* block) {
+        uint64_t b = 0, r = 0;
+        device().defrag_pool_bytes(&b, &r);
         *block = b;
-        return b > a ? b - a : 0;
+        return r;
+    };
+    auto under_low = [&](uint64_t r, uint64_t block) { return !block || r * 100 < low_pct * block || r == 0; };
+    // no more passes in this loading screen: the context ends now (between passes); the line comes when the loading screen ends
+    auto stop_work = [&](const char* why) {
+        if (device().defrag_active()) device().defrag_stop();
+        st.work_done = true;
+        st.outcome = why;
     };
     const uint32_t now = resid_ms();
-    if (nxrt::frame_limiter_unpaced()) {   // loading
-        if (!st.in_window) {
-            st.in_window = true;
-            st.done = false;
+    const bool unpaced = nxrt::frame_limiter_unpaced();
+    if (unpaced) {
+        if (!st.in_load) {   // a new loading screen: the pass budget, the marks
+            st.in_load = true;
+            st.work_done = false;
             st.started = now;
             st.passes = 0;
-            ++st.windows;
-            // the marks: armed over the high mark, disarmed under the low mark; a loading screen that is not armed moves nothing
+            st.outcome = "";
+            ++st.loads;
             uint64_t block = 0;
-            const uint64_t free = pool_free(&block);
-            st.free_before = free;
+            const uint64_t r = reclaimable(&block);
+            st.free_before = r;
             st.block_before = block;
-            if (!st.armed && block && free >= high_bytes && free * 100 >= high_pct * block) st.armed = true;
-            if (st.armed && (!block || free * 100 < low_pct * block)) st.armed = false;
-            if (!st.armed) st.done = true;
+            if (!st.armed && block && r >= high_bytes && r * 100 >= high_pct * block) st.armed = true;
+            if (st.armed && under_low(r, block)) st.armed = false;
+            if (!st.armed) {
+                st.work_done = true;
+                st.outcome = "under the marks";
+            }
         }
-        st.window_until = now + after_ms;
+        st.last_unpaced = now;
     }
     if (st.open) {   // the open pass: once its copies are done, the old images go and VMA moves the allocations
         if (poll_completed() < st.serial) return;
@@ -2391,43 +2409,40 @@ void tex_defrag_tick(Frame& f) {
         st.moves.clear();
         st.open = false;
         uint64_t block = 0;
-        const uint64_t free = pool_free(&block);
-        if (!block || free * 100 < low_pct * block) {   // under the low mark: done until it is over the high mark again
+        if (!st.work_done && under_low(reclaimable(&block), block)) {   // under the low mark: done until it is over the high mark again
             st.armed = false;
-            st.done = true;
+            stop_work("under the low mark");
         }
     }
-    if (!st.in_window) return;
-    auto finish = [&]() {
+    if (!st.in_load) return;
+    const uint32_t since = now - st.last_unpaced;
+    if (!unpaced && since > std::max(kMergeMs, after_ms)) {   // the loading screen is over (no pass is open here)
         if (device().defrag_active()) device().defrag_stop();
         const gfx::Device::DefragStats ds = device().defrag_take_stats();
         if (ds.passes || ds.blocks_freed) {
             uint64_t block = 0;
-            const uint64_t free = pool_free(&block);
+            const uint64_t r = reclaimable(&block);
             NXLOG_I(kTag, "defrag (loading screen %d): %llu textures moved (%.0f MiB) in %llu passes over %.1f s, %llu could not move; %llu blocks "
-                          "(%.0f MiB) given back to the driver; free inside the texture blocks %.0f of %.0f MiB before, %.0f of %.0f after (%s) "
-                          "([gfx] defrag)", st.windows, static_cast<unsigned long long>(ds.moved),
+                          "(%.0f MiB) given back to the driver; could give back %.0f of %.0f MiB of texture blocks before, %.0f of %.0f after "
+                          "(%s) ([gfx] defrag)", st.loads, static_cast<unsigned long long>(ds.moved),
                     ds.moved_bytes / 1048576.0, static_cast<unsigned long long>(ds.passes), (now - st.started) / 1000.0,
                     static_cast<unsigned long long>(ds.ignored), static_cast<unsigned long long>(ds.blocks_freed), ds.bytes_freed / 1048576.0,
-                    st.free_before / 1048576.0, st.block_before / 1048576.0, free / 1048576.0, block / 1048576.0,
-                    st.armed ? "goes on at the next loading screen" : "under the low mark");
+                    st.free_before / 1048576.0, st.block_before / 1048576.0, r / 1048576.0, block / 1048576.0,
+                    *st.outcome ? st.outcome : "the loading screen ended");
         }
-        st.in_window = false;
-    };
-    if (st.done || static_cast<int32_t>(now - st.window_until) > 0) {
-        finish();
+        st.in_load = false;
         return;
     }
-    if (st.passes >= max_passes) {   // this loading screen's share (finish ends the context; the next loading screen plans again)
-        st.done = true;
-        finish();
+    // passes only on loading frames, or within defrag_after_load_ms after them; never in the merge gap otherwise
+    if (st.work_done || (!unpaced && since > after_ms)) return;
+    if (st.passes >= max_passes) {
+        stop_work("pass cap; goes on at the next loading screen");
         return;
     }
     std::vector<gfx::Device::DefragMove> moves;
     ++st.passes;
-    if (!device().defrag_next_pass(max_bytes, max_moves, &moves)) {   // every pool done
-        st.done = true;
-        finish();
+    if (!device().defrag_next_pass(max_bytes, max_moves, &moves)) {   // every pool done (the context is ended)
+        stop_work("nothing more to move");
         return;
     }
     // owners: the live textures by their image record (a TexGpu shared by several texture objects can't move: movable() wants refs == 1)

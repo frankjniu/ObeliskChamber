@@ -1659,16 +1659,18 @@ void Device::defrag_stop() {
     impl_->defrag_pool_i = 0;
 }
 
-void Device::defrag_pool_bytes(uint64_t* block_bytes, uint64_t* alloc_bytes) const {
-    *block_bytes = *alloc_bytes = 0;
-    if (!impl_ || !impl_->kind_pools) return;
+void Device::defrag_pool_bytes(uint64_t* block_bytes, uint64_t* reclaimable) const {
+    *block_bytes = *reclaimable = 0;
+    if (!impl_ || !impl_->kind_pools || !impl_->kind_block) return;
+    const uint64_t bs = impl_->kind_block;
     std::lock_guard<std::mutex> lk(impl_->kind_pools_mu);
     for (const auto& [key, pool] : impl_->kind_pools_map) {
         if (key.first != static_cast<int>(VideoAllocKind::Texture) || !pool) continue;
         VmaStatistics ps{};
         vmaGetPoolStatistics(vma_, pool, &ps);
         *block_bytes += ps.blockBytes;
-        *alloc_bytes += ps.allocationBytes;
+        const uint64_t need = (ps.allocationBytes + bs - 1) / bs + 1;   // packed, plus the empty block VMA keeps
+        if (ps.blockCount > need) *reclaimable += (ps.blockCount - need) * bs;
     }
 }
 
