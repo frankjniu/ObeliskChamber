@@ -642,6 +642,12 @@ void framegen_present_end() {
         if (!s.t0) {
             s.t0 = now;
             s.ffx_count0 = ffx_fg_present_count();
+        } else if (const uint64_t restarted = ffx_fg_present_count(); restarted < s.ffx_count0) {
+            // the swapchain was remade (Alt+Enter, a resize) and FFX's present count started again: a window across that would count
+            // the shown frames from the restart only, against all of its game frames, so start the window again from here
+            s.t0 = now;
+            s.ffx_count0 = restarted;
+            s.n_game = s.n_on = s.n_extra_inputs = 0;
         } else if (now - s.t0 >= 2000000000ull) {
             const double sec = static_cast<double>(now - s.t0) * 1e-9;
             const uint64_t c = ffx_fg_present_count();

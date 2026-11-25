@@ -399,7 +399,10 @@ bool islider(Menu& m, const char* id, int* v, int lo, int hi, int step, const ch
     return commit;
 }
 
-bool button(Menu& m, const char* label) {
+// `help`: the help line of a button that is not in a row (row() sets it for the rest); without it the line would keep the text of
+// the last row drawn before the button.
+bool button(Menu& m, const char* label, const char* help = nullptr) {
+    if (help) m.row_help = help;
     const bool b = ImGui::Button(tr(label));
     after_item(m);
     return b;
@@ -1374,7 +1377,7 @@ void controls_page(UiHost& host, Menu& m, const play::LiveStatus& live) {
         }
         end_rows();
     }
-    if (button(m, "Reset the mapping")) {
+    if (button(m, "Reset the mapping", "Puts every button and key back to its default.")) {
         for (uint64_t& v : p.remap) v = play::kPadDefault;
         apply(host, m);
     }
@@ -1548,7 +1551,7 @@ void cpu_group(Menu& m) {
         ImGui::EndTable();
         ImGui::TextDisabled("%s", tr("A thread near 100% is busy all the time: it sets the frame rate whatever the GPU does."));
     }
-    if (button(m, "Write the CPU details to the log")) {
+    if (button(m, "Write the CPU details to the log", "Writes the processor details to ObeliskChamber.log, for a bug report.")) {
         cpu_log(m);
         notify(m, "CPU details written to the log.");
     }
@@ -1612,7 +1615,7 @@ void debug_page(UiHost& host, Menu& m, gfx::Overlay& ov) {
                             st.input_to_gpu_ms, st.sleep_ms_avg);
     }
     if (const int left = gfx::shader_backlog(); left > 0) ImGui::TextColored(kOrange, tr("Preparing shaders: %d left"), left);
-    if (button(m, "Write the last 30 s of frame times to the log")) {
+    if (button(m, "Write the last 30 s of frame times to the log", "Writes the frame times of the last 30 seconds to ObeliskChamber.log, for a bug report about stutter.")) {
         NXLOG_I(kTag, "frame times (F1 menu):\n%s", frame_times_summary(30.0).c_str());
         notify(m, "Frame time summary written to the log.");
     }
