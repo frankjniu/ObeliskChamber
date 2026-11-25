@@ -13,6 +13,7 @@
 // The commit/recovery design is smo-recomp runtime/fs/nnfs.c (GPL-3.0), see fs_volume.h.
 #define _SILENCE_CXX20_U8PATH_DEPRECATION_WARNING
 #include <atomic>
+#include <chrono>
 #include <algorithm>
 #include <cwctype>
 #include <cstdio>
@@ -232,6 +233,22 @@ void slot_path(const std::string& sr, std::string* path, bool write) {
 GaugeCounter g_open_files("fs.open_files");
 GaugeCounter g_open_dirs("fs.open_dirs");
 GaugeCounter g_bytes_read("fs.bytes_read");   // bytes returned by IFile::Read so far
+// Reads of files and of the RomFS storage, for the hitch line and the load breakdown ([diag] load_log): KiB read and the time the
+// reads themselves took (the host read, not the IPC around it; the game's decompression is guest code and not in it).
+std::atomic<uint64_t> g_read_bytes{0};
+std::atomic<uint64_t> g_read_us{0};
+const bool g_read_hitch = (nxrt::hitch_add_counter("fs_read_kb", []() -> uint64_t { return g_read_bytes.load(std::memory_order_relaxed) >> 10; }),
+                           nxrt::hitch_add_counter("fs_read_ms", []() -> uint64_t { return g_read_us.load(std::memory_order_relaxed) / 1000; }),
+                           true);
+// Times one read into the two counters above.
+struct ReadTimer {
+    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    void done(uint64_t bytes) {
+        const auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+        g_read_us.fetch_add(static_cast<uint64_t>(us), std::memory_order_relaxed);
+        g_read_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    }
+};
 struct OpenCount {
     explicit OpenCount(GaugeCounter& g) : c(g) { c.add(1); }
     ~OpenCount() { c.sub(1); }
@@ -249,7 +266,9 @@ std::shared_ptr<Service> make_file(std::shared_ptr<fs::VFile> f, const std::stri
             const ipc::Buffer out = req.out_buf(0);
             if (!out.addr && size) return fs::rc::kInvalidArgument;
             uint64_t got = 0;
+            ReadTimer rt;
             const uint32_t r = f->read(off, reinterpret_cast<void*>(static_cast<uintptr_t>(out.addr)), std::min(size, out.size), &got);
+            rt.done(got);
             if (r) return r;
             g_bytes_read.add(static_cast<int64_t>(got));
             rsp.push<uint64_t>(got);
@@ -430,7 +449,10 @@ std::shared_ptr<Service> make_storage_rom(std::shared_ptr<fs::RomfsImage> img) {
             const ipc::Buffer out = req.out_buf(0);
             if (!out.addr || out.size < static_cast<uint64_t>(size)) return fs::rc::kInvalidArgument;
             if (static_cast<uint64_t>(off) + static_cast<uint64_t>(size) > img->size()) return fs::rc::kOutOfRange;
-            return img->read(static_cast<uint64_t>(off), reinterpret_cast<void*>(static_cast<uintptr_t>(out.addr)), static_cast<uint64_t>(size)) ? 0 : fs::rc::kGenericFailure;
+            ReadTimer rt;
+            const bool ok = img->read(static_cast<uint64_t>(off), reinterpret_cast<void*>(static_cast<uintptr_t>(out.addr)), static_cast<uint64_t>(size));
+            rt.done(ok ? static_cast<uint64_t>(size) : 0);
+            return ok ? 0 : fs::rc::kGenericFailure;
         });
         s.add_cmd(1, "Write", [](Request&, Response&) -> uint32_t { return kUnsupportedWrite; });
         s.add_cmd(2, "Flush", [](Request&, Response&) -> uint32_t { return 0; });
