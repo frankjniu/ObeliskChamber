@@ -429,6 +429,11 @@ pub fn rebuild_needed(install: &Path, game_dir: &Path) -> (Option<bool>, String)
     }
     let mut c = Command::new(crate::setup::package_python(&tools));
     c.arg("-I").arg(tools.join("build").join("fefw_build.py")).arg("--check").arg("--game").arg(game_dir);
+    // the build for this processor, as Set up's check passes it (setup.rs): without it the check compares against the default
+    // build and can call the right ObeliskChamber.exe out of date, or miss one built for the other processor (fefw-recomp #172)
+    if let Some(v) = crate::cpu::build_variant() {
+        c.args(["--cpu", v]);
+    }
     crate::setup::quiet(&mut c);
     match c.stdin(Stdio::null()).output() {
         Ok(o) => {
