@@ -229,6 +229,7 @@ void residency_begin_submit(Frame& f) {
         last_restore = now;
         if (residency_on()) tex_residency_restore(f);
         tex_defrag_test(f);   // [gfx] defrag_test_moves (off by default)
+        tex_load_uploads(f);  // [nvn] load_uploads_ms: textures uploaded during loading screens
         tex_defrag_tick(f);   // [gfx] defrag: passes at loading screens
     }
 }

@@ -2420,6 +2420,46 @@ void tex_defrag_tick(Frame& f) {
     st.open = true;
 }
 
+// [nvn] load_uploads_ms (default 8; 0 = off): while a loading screen shows (the frame limiter's loading state), the first uploads of
+// registered asset textures whose background preparation is done go in, up to this much render-thread time a present, at the start of
+// the submission (no pass is open there). The load-in frame and the ones after it then find most of the area's textures ready instead of
+// uploading them between their draws (Red Tunic's RX_VK_TEX_AHEAD has the same aim: a save's textures made during its loading screen).
+// Only textures nothing has used yet (tex_early_upload_ok) and whose prepared result waits (texprep::has_result): no CPU transcode or untile
+// here. The census line `textures ... never sampled` stays small (registered textures are drawn sooner or later), so little goes in that
+// would not have anyway.
+namespace {
+std::atomic<uint64_t> g_load_uploads{0};
+const bool g_load_uploads_hitch = (nxrt::hitch_add_counter("load_uploads", []() -> uint64_t { return g_load_uploads.load(std::memory_order_relaxed); }), true);
+}  // namespace
+
+void tex_load_uploads(Frame& f) {
+    static const int64_t budget_ms = std::clamp<int64_t>(nxrt::config_get_int("nvn", "load_uploads_ms", 8), 0, 1000);
+    if (budget_ms <= 0 || !nxrt::frame_limiter_unpaced()) return;
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(budget_ms);
+    std::unordered_set<const Texture*> reg;
+    pool_registered_textures(reg);
+    uint64_t n = 0;
+    for (const Texture* ct : reg) {
+        Texture* t = const_cast<Texture*>(ct);
+        if (!tex_early_upload_ok(t) || !texprep::has_result(t)) continue;
+        tex_ensure_current(t, f);
+        tex_transition(t, f, tex_sampled_layout(t));
+        ++n;
+        if ((n & 7) == 0 && std::chrono::steady_clock::now() >= until) break;
+    }
+    if (!n) return;
+    static uint64_t total = 0;
+    static uint32_t logged_at = 0;
+    total += n;
+    g_load_uploads.fetch_add(n, std::memory_order_relaxed);
+    const uint32_t now = static_cast<uint32_t>(counters().presents.load(std::memory_order_relaxed));
+    if (now - logged_at >= 300) {
+        logged_at = now;
+        NXLOG_I(kTag, "loading screens: %llu textures uploaded ahead so far (%zu registered now; [nvn] load_uploads_ms)", static_cast<unsigned long long>(total),
+                reg.size());
+    }
+}
+
 // [gfx] defrag_test_moves (default 0, a test aid for the defragmentation plan): every present, this many textures move to new memory
 // (tex_move), taken in turn from the registered ones that can move, so that a run with screenshots shows whether a move is ever visible.
 void tex_defrag_test(Frame& f) {
@@ -3225,6 +3265,12 @@ bool tex_first_upload_deferrable(Texture* t) {
         return lazy && active() && !t->destroyed.load(std::memory_order_relaxed) && t->fmt->aspect == kAspectColor && t->b.samples <= 1 && !texture_registry_find_alias(t);
     }
     return !g->failed && !g->uploaded && !g->gpu_written && !g->depth && !g->promoted && g->scale == 1.0f;
+}
+
+bool tex_early_upload_ok(Texture* t) {
+    if (!tex_first_upload_deferrable(t) || !t->mem || t->vpool) return false;
+    const TexGpu* g = t->gpu;
+    return !g || (!g->sparse && g->layout == VK_IMAGE_LAYOUT_UNDEFINED);
 }
 
 bool tex_first_upload_uncompressed_deferrable(Texture* t) {

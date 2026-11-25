@@ -330,6 +330,10 @@ bool tex_pool_preparation_pending(Texture* t);
 // (ASTC or BCn from the game's memory) whose image never held content, is not rendered to, and is not a depth image. Its pool element is the dummy
 // until then. Render thread.
 bool tex_first_upload_deferrable(Texture* t);
+// A first upload that may go in ahead of everything recorded so far ([nvn] load_uploads_ms): an ASTC or BC asset from the game's
+// memory (written by the CPU, never by the GPU) whose image no command has used yet: no image, or one still in the undefined layout
+// (every use transitions it first). Not a sparse texture of a virtual pool.
+bool tex_early_upload_ok(Texture* t);
 // The image holds a stand-in of the texture's current content and the texture is waiting for its upload (its job's result is there, or the
 // render thread will keep the stand-in): the swap may wait a frame (the pool upload budget). Render thread.
 bool tex_standin_swap_pending(Texture* t);

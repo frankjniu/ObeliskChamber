@@ -70,6 +70,8 @@ void tex_residency_restore(Frame& f);
 void tex_defrag_test(Frame& f);
 // nvn_gpu_texture.cpp, once per present: [gfx] defrag, VMA defragmentation passes of the texture pools at loading screens
 void tex_defrag_tick(Frame& f);
+// nvn_gpu_texture.cpp, once per present while loading: [nvn] load_uploads_ms of first uploads whose background preparation is done
+void tex_load_uploads(Frame& f);
 void tex_mark_seen(Texture* t);      // nvn_gpu_texture.cpp: a shader indexed t through a pool array
 // Set by the pool arrays around their tex_sampled_view calls: writing a pool descriptor is not a use (only the marks are).
 extern thread_local bool g_resid_pool_view;
