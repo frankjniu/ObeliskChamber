@@ -260,6 +260,8 @@ public:
     void defrag_stop();                    // ends the context between passes (the load is over)
     bool defrag_active() const;            // a context is open
     DefragStats defrag_take_stats();       // since the last call
+    // The texture pools' blocks and what their allocations take (free inside the blocks = blocks - allocations).
+    void defrag_pool_bytes(uint64_t* block_bytes, uint64_t* alloc_bytes) const;
     // A new VkImage of the description bound at an allocation (a defragmentation move's destination); no view, no allocation of its own.
     VkResult create_image_at(const ImageDesc& d, VmaAllocation at, VkImage* out);
     FormatCheckStats format_check_stats() const;

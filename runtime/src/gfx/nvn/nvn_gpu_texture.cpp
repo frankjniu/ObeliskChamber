@@ -2327,9 +2327,13 @@ static bool tex_move_at(Texture* t, TexGpu* g, Frame& f, VmaAllocation dst, std:
 }
 
 // [gfx] defrag (auto: on with [gfx] kind_pools): at loading screens (the frame limiter's loading state, and [gfx] defrag_after_load_ms after
-// it), VMA's defragmentation of the texture pools runs one pass at a time: each pass moves at most defrag_mb_per_pass MiB and
-// defrag_moves_per_pass textures (tex_move_at), and ends once the GPU finished its copies, so that whole blocks empty and go back to the
-// driver. Textures that can't move now are left where they are (the move is ignored). One log line per loading screen.
+// it, default 0: play is never touched), VMA's defragmentation of the texture pools runs one pass at a time: each pass moves at most
+// defrag_mb_per_pass MiB and defrag_moves_per_pass textures (tex_move_at), and ends once the GPU finished its copies, so that whole blocks
+// empty and go back to the driver. Textures that can't move now are left where they are (the move is ignored). It only runs once the free
+// space inside the texture pools' blocks is over defrag_high_pct % and defrag_high_mb MiB, and stops (until the high mark again) once
+// it is under defrag_low_pct %; at most defrag_passes_per_load passes a loading screen. One log line per loading screen that moved.
+// (The hour-long soak at every loading screen: ~0.3 GB less video memory, but 122,589 moves, slower loading-screen frames and a 4-6%
+// lower 1% low in the walk after each load from the passes after it.)
 void tex_defrag_tick(Frame& f) {
     if (!device().defrag_enabled()) return;
     struct State {
@@ -2340,18 +2344,40 @@ void tex_defrag_tick(Frame& f) {
         std::vector<VkImageView> old_views;
         uint32_t window_until = 0, started = 0;
         int windows = 0;
+        bool armed = false;          // free space went over the high mark; until it is under the low mark
+        uint32_t passes = 0;         // passes in this loading screen
+        uint64_t free_before = 0, block_before = 0;
     };
     static State st;
     static const uint64_t max_bytes = static_cast<uint64_t>(std::clamp<int64_t>(nxrt::config_get_int("gfx", "defrag_mb_per_pass", 64), 1, 4096)) << 20;
     static const uint32_t max_moves = static_cast<uint32_t>(std::clamp<int64_t>(nxrt::config_get_int("gfx", "defrag_moves_per_pass", 256), 1, 65536));
-    static const uint32_t after_ms = static_cast<uint32_t>(std::clamp<int64_t>(nxrt::config_get_int("gfx", "defrag_after_load_ms", 3000), 0, 600000));
+    static const uint32_t after_ms = static_cast<uint32_t>(std::clamp<int64_t>(nxrt::config_get_int("gfx", "defrag_after_load_ms", 0), 0, 600000));
+    static const uint64_t high_pct = static_cast<uint64_t>(std::clamp<int64_t>(nxrt::config_get_int("gfx", "defrag_high_pct", 15), 0, 100));
+    static const uint64_t high_bytes = static_cast<uint64_t>(std::clamp<int64_t>(nxrt::config_get_int("gfx", "defrag_high_mb", 128), 0, 65536)) << 20;
+    static const uint64_t low_pct = static_cast<uint64_t>(std::clamp<int64_t>(nxrt::config_get_int("gfx", "defrag_low_pct", 5), 0, 100));
+    static const uint32_t max_passes = static_cast<uint32_t>(std::clamp<int64_t>(nxrt::config_get_int("gfx", "defrag_passes_per_load", 4), 1, 100000));
+    auto pool_free = [](uint64_t* block) {
+        uint64_t b = 0, a = 0;
+        device().defrag_pool_bytes(&b, &a);
+        *block = b;
+        return b > a ? b - a : 0;
+    };
     const uint32_t now = resid_ms();
     if (nxrt::frame_limiter_unpaced()) {   // loading
         if (!st.in_window) {
             st.in_window = true;
             st.done = false;
             st.started = now;
+            st.passes = 0;
             ++st.windows;
+            // the marks: armed over the high mark, disarmed under the low mark; a loading screen that is not armed moves nothing
+            uint64_t block = 0;
+            const uint64_t free = pool_free(&block);
+            st.free_before = free;
+            st.block_before = block;
+            if (!st.armed && block && free >= high_bytes && free * 100 >= high_pct * block) st.armed = true;
+            if (st.armed && (!block || free * 100 < low_pct * block)) st.armed = false;
+            if (!st.armed) st.done = true;
         }
         st.window_until = now + after_ms;
     }
@@ -2364,23 +2390,41 @@ void tex_defrag_tick(Frame& f) {
         device().defrag_end_pass(st.moves);
         st.moves.clear();
         st.open = false;
+        uint64_t block = 0;
+        const uint64_t free = pool_free(&block);
+        if (!block || free * 100 < low_pct * block) {   // under the low mark: done until it is over the high mark again
+            st.armed = false;
+            st.done = true;
+        }
     }
     if (!st.in_window) return;
     auto finish = [&]() {
         if (device().defrag_active()) device().defrag_stop();
         const gfx::Device::DefragStats ds = device().defrag_take_stats();
-        if (ds.passes || ds.blocks_freed)
+        if (ds.passes || ds.blocks_freed) {
+            uint64_t block = 0;
+            const uint64_t free = pool_free(&block);
             NXLOG_I(kTag, "defrag (loading screen %d): %llu textures moved (%.0f MiB) in %llu passes over %.1f s, %llu could not move; %llu blocks "
-                          "(%.0f MiB) given back to the driver ([gfx] defrag)", st.windows, static_cast<unsigned long long>(ds.moved),
+                          "(%.0f MiB) given back to the driver; free inside the texture blocks %.0f of %.0f MiB before, %.0f of %.0f after (%s) "
+                          "([gfx] defrag)", st.windows, static_cast<unsigned long long>(ds.moved),
                     ds.moved_bytes / 1048576.0, static_cast<unsigned long long>(ds.passes), (now - st.started) / 1000.0,
-                    static_cast<unsigned long long>(ds.ignored), static_cast<unsigned long long>(ds.blocks_freed), ds.bytes_freed / 1048576.0);
+                    static_cast<unsigned long long>(ds.ignored), static_cast<unsigned long long>(ds.blocks_freed), ds.bytes_freed / 1048576.0,
+                    st.free_before / 1048576.0, st.block_before / 1048576.0, free / 1048576.0, block / 1048576.0,
+                    st.armed ? "goes on at the next loading screen" : "under the low mark");
+        }
         st.in_window = false;
     };
     if (st.done || static_cast<int32_t>(now - st.window_until) > 0) {
         finish();
         return;
     }
+    if (st.passes >= max_passes) {   // this loading screen's share (finish ends the context; the next loading screen plans again)
+        st.done = true;
+        finish();
+        return;
+    }
     std::vector<gfx::Device::DefragMove> moves;
+    ++st.passes;
     if (!device().defrag_next_pass(max_bytes, max_moves, &moves)) {   // every pool done
         st.done = true;
         finish();
