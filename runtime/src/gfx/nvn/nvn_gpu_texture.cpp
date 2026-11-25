@@ -2353,6 +2353,7 @@ void tex_defrag_tick(Frame& f) {
         uint32_t passes = 0;         // passes in this loading screen
         uint64_t free_before = 0, block_before = 0;
         const char* outcome = "";
+        uint32_t last_check = 0;     // the last look at the high mark while not armed
     };
     static State st;
     constexpr uint32_t kMergeMs = 1500;
@@ -2396,6 +2397,19 @@ void tex_defrag_tick(Frame& f) {
                 st.work_done = true;
                 st.outcome = "under the marks";
             }
+            st.last_check = now;
+        } else if (!st.armed && now - st.last_check >= 250) {
+            // the gaps mostly appear while the load frees the old area's textures, after its first frame: look again every 250 ms
+            st.last_check = now;
+            uint64_t block = 0;
+            const uint64_t r = reclaimable(&block);
+            if (block && r >= high_bytes && r * 100 >= high_pct * block) {
+                st.armed = true;
+                st.work_done = false;
+                st.outcome = "";
+                st.free_before = r;
+                st.block_before = block;
+            }
         }
         st.last_unpaced = now;
     }
@@ -2434,7 +2448,7 @@ void tex_defrag_tick(Frame& f) {
         return;
     }
     // passes only on loading frames, or within defrag_after_load_ms after them; never in the merge gap otherwise
-    if (st.work_done || (!unpaced && since > after_ms)) return;
+    if (st.work_done || (!unpaced && (after_ms == 0 || since > after_ms))) return;
     if (st.passes >= max_passes) {
         stop_work("pass cap; goes on at the next loading screen");
         return;

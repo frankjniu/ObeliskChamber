@@ -1654,9 +1654,9 @@ void Device::defrag_end_pass(const std::vector<DefragMove>& moves) {
 }
 
 void Device::defrag_stop() {
+    impl_->defrag_pool_i = 0;   // also with no context open: a pass that finished the last pool left the index past the end
     if (!impl_->defrag_ctx) return;
     defrag_end_context(vma_, impl_);
-    impl_->defrag_pool_i = 0;
 }
 
 void Device::defrag_pool_bytes(uint64_t* block_bytes, uint64_t* reclaimable) const {
