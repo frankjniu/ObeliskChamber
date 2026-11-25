@@ -436,7 +436,8 @@ NXTEST(svc_time_shared_memory_writes_survive_remapping) {
         }
     });
     int lost = 0;
-    for (int i = 0; i < 20000; ++i) {
+    // 2000 rounds: each waits for the guest thread's map or unmap, about 3.5 ms on Windows, so 20000 took 70 s of every test run
+    for (int i = 0; i < 2000; ++i) {
         const uint8_t on = static_cast<uint8_t>(i & 1);
         st.call(101, nxsvc::Args().u8(on));
         kernel::with_shared_memory_host(*obj, [&](uint64_t host) {
