@@ -150,6 +150,8 @@ if ($sdkBin -and (Test-Path (Join-Path $sdkBin 'spirv-cross.exe')) -and (Test-Pa
     Write-Warning "VULKAN_SDK has no Bin\spirv-cross.exe and Bin\glslang.exe: the package is made without them, so Set up's decompiled lighting shader option will do nothing"
 }
 (Get-Content -Raw "$root\game-build\release\README.txt").Replace('@VERSION@', $Version) | Set-Content -NoNewline (Join-Path $pkg 'README.txt')
+# RecompLauncher reads it from the top of the zip, next to the programs (recomplauncher.json in the checkout; its docs/DEVELOPERS.md)
+Put "$root\recomplauncher.json" 'recomplauncher.json'
 Put "$root\LICENSE" 'LICENSE.txt'
 Put "$root\LEGAL.md" 'LEGAL.txt'
 Put "$root\game-build\release\BUNDLED_TOOLS.txt" 'licenses\BUNDLED_TOOLS.txt'
