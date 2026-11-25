@@ -701,12 +701,15 @@ struct Renderer::Impl {
             ci.pNext = &fse;
         }
 #endif
+        // before vkCreateSwapchainKHR, which retires `old`: vkWaitForPresentKHR must not wait on a retired swapchain
+        // (VUID-vkWaitForPresentKHR-swapchain-04997), so the present-wait thread lets go of it first. Not under the queue lock: it may
+        // wait for that thread (up to one 10 ms wait).
+        if (old && plog) plog->swapchain_going(old);
         extras::framegen_swapchain_reset();
         VkSwapchainKHR fresh = VK_NULL_HANDLE;
         VkResult r = vkCreateSwapchainKHR(vk(), &ci, nullptr, &fresh);
         if (r == VK_SUCCESS) vk_gauge_swapchains().add(1);
         destroy_targets();
-        if (old && plog) plog->swapchain_going(old);   // (before the queue lock: it may wait for the present-wait thread)
         if (old) {   // under the queue lock: the Reflex calls (lowlat.cpp) read the handle under it, from other threads
             std::lock_guard<std::mutex> ql(dev->queue_mutex());
             if (latency) latency->swapchain_destroyed(old);

@@ -832,7 +832,10 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
     if (x_hdrmd) dev_exts.push_back(VK_EXT_HDR_METADATA_EXTENSION_NAME);
     const bool x_pid = !headless && add_ext(VK_KHR_PRESENT_ID_EXTENSION_NAME, &apid);
     const bool x_ll2 = x_pid && has_dext(VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
-    const bool x_pw = x_pid && add_ext(VK_KHR_PRESENT_WAIT_EXTENSION_NAME, &apw);   // [gfx] present_log (present_log.h)
+    // [gfx] present_log (present_log.h): enabled only when the log will use it, so present_log = false (and frame generation, whose
+    // swapchain the log leaves alone) keep the device exactly as before the log existed
+    const bool want_pw = config_get_bool("gfx", "present_log", true) && !extras::framegen_requested();
+    const bool x_pw = x_pid && want_pw && add_ext(VK_KHR_PRESENT_WAIT_EXTENSION_NAME, &apw);
     if (x_ll2) dev_exts.push_back(VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
     const bool x_aal = !headless && add_ext(VK_AMD_ANTI_LAG_EXTENSION_NAME, &aal);
     // the OS's video memory budget and this process' usage per heap, which vmaGetHeapBudgets (the vma.device_* gauges, the memory guard)

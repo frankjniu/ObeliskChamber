@@ -20,7 +20,7 @@
 namespace nxrt::gfx {
 namespace {
 constexpr const char* kTag = "gfx.present";
-constexpr uint64_t kWaitNs = 50000000ull;          // one vkWaitForPresentKHR call at most (the swapchain may be going)
+constexpr uint64_t kWaitNs = 10000000ull;          // one vkWaitForPresentKHR call at most: swapchain_going waits for it, on the render thread
 constexpr uint64_t kGiveUpNs = 2000000000ull;      // a present not shown after this long is dropped from the log
 constexpr int64_t kLogEveryNs = 60000000000ll;
 
@@ -34,11 +34,14 @@ struct PresentLog::Impl {
     std::thread th;
     std::mutex qmu;                   // the queue
     std::condition_variable qcv;
-    struct Item { VkSwapchainKHR sc; uint64_t id; int64_t queued_ns; };
+    struct Item { VkSwapchainKHR sc; uint64_t id; int64_t queued_ns; uint64_t gen; };
     std::deque<Item> q;
     bool stop = false;
     std::mutex wait_mu;               // held by the waiter around each vkWaitForPresentKHR
-    VkSwapchainKHR gone = VK_NULL_HANDLE;   // under qmu: the waiter drops this swapchain's items
+    // under qmu: goes up each time a swapchain goes (swapchain_going). An item queued before that is never waited on: a single "gone"
+    // handle could be overwritten by a second swapchain going while the waiter still held an item of the first, or match a new
+    // swapchain that got the same handle value.
+    uint64_t gen = 0;
     // ids (render thread, under the queue lock of the device)
     uint64_t last_id = 0;
     bool broken = false;              // an id would have gone backwards (low latency took ids of its own): the log stopped
@@ -103,14 +106,14 @@ struct PresentLog::Impl {
                 {
                     std::lock_guard<std::mutex> lk(qmu);
                     if (stop) return;
-                    if (gone == it.sc) break;
+                    if (it.gen != gen) break;
                 }
                 VkResult r;
                 {
                     std::lock_guard<std::mutex> wl(wait_mu);
                     {
                         std::lock_guard<std::mutex> lk(qmu);
-                        if (gone == it.sc) break;
+                        if (it.gen != gen) break;
                     }
                     r = vkWaitForPresentKHR(dev, it.sc, it.id, kWaitNs);
                 }
@@ -178,9 +181,8 @@ void PresentLog::presented(VkSwapchainKHR sc, uint64_t id) {
     if (!id || !sc || !s.track) return;
     {
         std::lock_guard<std::mutex> lk(s.qmu);
-        if (s.gone == sc) s.gone = VK_NULL_HANDLE;   // (a handle can come back for a new swapchain)
         if (s.q.size() >= 64) s.q.pop_front();         // the waiter is far behind (a hung display): keep the newest
-        s.q.push_back({sc, id, now_ns()});
+        s.q.push_back({sc, id, now_ns(), s.gen});
     }
     s.qcv.notify_one();
 }
@@ -190,7 +192,7 @@ void PresentLog::swapchain_going(VkSwapchainKHR sc) {
     Impl& s = *impl_;
     {
         std::lock_guard<std::mutex> lk(s.qmu);
-        s.gone = sc;
+        ++s.gen;
         s.q.erase(std::remove_if(s.q.begin(), s.q.end(), [&](const Impl::Item& i) { return i.sc == sc; }), s.q.end());
     }
     std::lock_guard<std::mutex> wl(s.wait_mu);   // the waiter is out of any wait on it
