@@ -2420,7 +2420,7 @@ void tex_defrag_tick(Frame& f) {
     st.open = true;
 }
 
-// [nvn] load_uploads_ms (default 8; 0 = off): while a loading screen shows (the frame limiter's loading state), the first uploads of
+// [nvn] load_uploads_ms (default 16; 0 = off): while a loading screen shows (the frame limiter's loading state), the first uploads of
 // registered asset textures whose background preparation is done go in, up to this much render-thread time a present, at the start of
 // the submission (no pass is open there). The load-in frame and the ones after it then find most of the area's textures ready instead of
 // uploading them between their draws (Red Tunic's RX_VK_TEX_AHEAD has the same aim: a save's textures made during its loading screen).
@@ -2433,7 +2433,7 @@ const bool g_load_uploads_hitch = (nxrt::hitch_add_counter("load_uploads", []() 
 }  // namespace
 
 void tex_load_uploads(Frame& f) {
-    static const int64_t budget_ms = std::clamp<int64_t>(nxrt::config_get_int("nvn", "load_uploads_ms", 8), 0, 1000);
+    static const int64_t budget_ms = std::clamp<int64_t>(nxrt::config_get_int("nvn", "load_uploads_ms", 16), 0, 1000);
     if (budget_ms <= 0 || !nxrt::frame_limiter_unpaced()) return;
     const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(budget_ms);
     std::unordered_set<const Texture*> reg;
