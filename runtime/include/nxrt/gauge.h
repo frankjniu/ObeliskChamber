@@ -133,6 +133,8 @@ void note_loading(bool loading);
 void note_load_frame(bool low, bool stalled);
 // Logs the load breakdown line of a load that is still open (the process is ending).
 void load_log_flush();
+// [diag] fault_watch (default off): page faults split by address and by faulting code into pf_* hitch counters (src/diag/fault_watch.cpp).
+void fault_watch_start();
 // The draws of each presented frame, from the same place (for `@loaded draws=<n>`). Any thread, lock-free.
 void note_frame_draws(uint32_t draws);
 LoadInfo load_info();

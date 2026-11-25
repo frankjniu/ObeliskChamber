@@ -75,6 +75,7 @@ bool init(const InitOptions& opt) {
     if (opt.memguard) memguard_start();
     if (opt.watchdog) watchdog_start();
     config_log_effective();
+    fault_watch_start();        // [diag] fault_watch: page faults split by address and code (pf_* hitch counters); off by default
     hitch_start();              // frame summary every 10 s and a line per frame over 50 ms ([diag] hitch_log / hitch_summary_s / hitch_ms); on by default
     soak_start();               // gauge sampler ([diag] soak_csv); a no-op when unset
     prof_sampler_start();       // sampling profiler ([prof] sample_hz); a no-op when unset
