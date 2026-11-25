@@ -59,6 +59,7 @@ bool init(const InitOptions& opt) {
         NXLOG_E("runtime", "address-space layout could not be reserved");
         ok = false;
     }
+    if (opt.memory_init && ok) mem::unmapped_install();   // [memory] unmapped_access: as the yuzu-family emulators
     svc_init();
     kernel::install_spin_hint();
     kernel::starvation_guard_start();

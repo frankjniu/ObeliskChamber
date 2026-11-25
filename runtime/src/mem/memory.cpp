@@ -363,6 +363,7 @@ bool reserve_fixed(uint64_t addr, uint64_t size, const char* tag) {
     }
     size = align_up(size, kPage);
     std::lock_guard lk(g_fixed_mu);
+    unmapped_release(addr, size);   // zeroed granules mapped for unmapped guest accesses ([memory] unmapped_access)
     void* p = VirtualAlloc(reinterpret_cast<void*>(addr), static_cast<SIZE_T>(size), MEM_RESERVE, PAGE_NOACCESS);
     if (!p) {
         DWORD e = GetLastError();

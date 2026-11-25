@@ -53,6 +53,11 @@ bool decommit(uint64_t addr, uint64_t size);
 bool protect(uint64_t addr, uint64_t size, Prot p);
 uint64_t alloc_kernel(uint64_t size, uint64_t align = kPage);   // committed RW memory from the kernel region (bump allocator)
 bool is_mapped(uint64_t addr, uint64_t size);                // every byte of the range is committed and accessible (VirtualQuery)
+// [memory] unmapped_access = zero (default): guest reads of unmapped addresses below 4 GiB return 0 (and writes there land in zeroed
+// memory) instead of crashing, as on the yuzu-family emulators (src/mem/unmapped.cpp). unmapped_release gives back the zeroed granules
+// that overlap a range about to be reserved.
+void unmapped_install();
+void unmapped_release(uint64_t addr, uint64_t size);
 
 // ---- heap section ---------------------------------------------------------------------------------------------------
 // One pagefile-backed section (SEC_RESERVE, nothing is charged until committed) with a primary view at kHeapBase. Under Wine
