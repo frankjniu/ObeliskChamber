@@ -864,8 +864,28 @@ pub fn check_tools(package: bool) -> Vec<Tool> {
     ];
     items
         .into_iter()
-        .map(|(name, p, hint)| Tool { name: name.into(), ok: p.is_some(), found: p.map(|p| crate::dump::fwd(&p)).unwrap_or_default(), hint: hint.into() })
+        .map(|(name, p, hint)| {
+            // a clang-cl older than 22 is listed as missing: the Visual Studio 18 C++ library (MSVC 14.52) refuses it with STL1000
+            let old = name.starts_with("LLVM") && p.as_deref().and_then(clang_major).is_some_and(|v| v < 22);
+            let found = p.as_ref().map(|p| crate::dump::fwd(p)).unwrap_or_default();
+            Tool { name: name.into(), ok: p.is_some() && !old, found, hint: hint.into() }
+        })
         .collect()
+}
+
+/// The major version clang-cl reports ("clang version 23.1.3" gives 23); None when it does not run or says something else.
+fn clang_major(exe: &Path) -> Option<u32> {
+    let mut cmd = Command::new(exe);
+    cmd.arg("--version").stdin(Stdio::null()).stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let out = cmd.output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let rest = &text[text.find("clang version ")? + "clang version ".len()..];
+    rest.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
 }
 
 /// The Ryujinx source tree the shader translator is built from (MIT). `RYUBING_DIR`, else `<repo>/work/refs/ryubing`, cloned on

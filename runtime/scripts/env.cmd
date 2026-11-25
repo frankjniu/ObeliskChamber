@@ -18,3 +18,5 @@ if not defined LLVM_BIN set "LLVM_BIN=%NX_LLVM_BIN%"
 call "%NX_VCVARS%" >nul
 rem ninja's folder goes last: a folder that holds ninja may also hold another compiler or an older cmake
 set "PATH=%NX_LLVM_BIN%;%NX_CMAKE_BIN%;%PATH%;%NX_NINJA_BIN%"
+rem a clang-cl too old for this Visual Studio's C++ library stops here with a clear message (check_clang.cmd)
+call "%~dp0check_clang.cmd"

@@ -4,6 +4,8 @@ For development. Players should use the zip on the Releases page instead. You ne
 
 - Visual Studio 2022 Build Tools or newer, with "Desktop development with C++" (found with vswhere)
 - LLVM 23 or newer (`clang-cl`), in `C:\Program Files\LLVM\bin`, or named by `NX_LLVM` (its bin folder) or `NX_TOOLCHAIN` (a folder with `llvm\bin`)
+  Visual Studio 18's C++ library (MSVC 14.52) refuses clang older than 22 with error STL1000; the build scripts and Set up check
+  the version first and say so.
 - CMake 3.25+, Ninja, Git, [uv](https://docs.astral.sh/uv/) (it fetches Python 3.13), .NET 10 SDK, PowerShell 7 (or Windows PowerShell)
 - for the launcher: Rust (stable) and Node.js 20+
 - NASM 2.14+ (on PATH, or `NX_TOOLCHAIN\bin`, or `-DNXRT_NASM=<nasm.exe>`): the movie decoder's assembly. Without it the runtime still

@@ -11,6 +11,7 @@ if not defined NX_LLVM set "NX_LLVM=C:\Program Files\LLVM\bin"
 if not defined NX_TOOLS set "NX_TOOLS=C:\Program Files\CMake\bin"
 call "%NX_VCVARS%" >nul
 set "PATH=%NX_LLVM%;%NX_TOOLS%;%LOCALAPPDATA%\Microsoft\WinGet\Links;%~dp0..\..\tools\.venv\Scripts;%PATH%"
+call "%~dp0..\..\runtime\scripts\check_clang.cmd" || exit /b 1
 if "%~1"=="" (
   clang-cl --version & cmake --version & ninja --version & sccache --version
   exit /b 0
