@@ -161,11 +161,11 @@ std::string format_event(const HitchEvent& ev, size_t others) {
     char b[400];
     snprintf(b, sizeof b, "frame %llu took %.1f ms (t=%.1f s)", (unsigned long long)ev.frame, ev.ms, ev.at_s);
     std::string out = b;
-    const size_t ns = std::min(a.ns, b.ns);
+    const size_t ns = g_nsrc.load(std::memory_order_acquire);
     bool any = false;
     for (size_t i = 0; i < ns; i++) {
         if (ev.val[i] == 0) continue;
-        out += any ? ", " : "; during it (counters, all threads): ";
+        out += any ? ", " : "; during it: ";
         out += g_src[i].label;
         snprintf(b, sizeof b, " %s%lld", g_src[i].counter ? "+" : "=", (long long)ev.val[i]);
         out += b;
@@ -622,8 +622,9 @@ uint64_t g_load_ep_count = 0;   // episodes so far (under g_load_mu)
 // previous frame (taken at every frame outside a load), copied to `g_load_cand` at the first frame of a low-draw run or at a stall in
 // one; the stall before the first loading frame is then in the line. The end is the last stall (`g_load_last_stall`) when the load ends on a light
 // screen that kept presenting (pacing comes back 1.5 s later), or the frame itself when an area frame ends it.
-LoadSnap g_load_prev, g_load_cand, g_load_last_stall;
-bool g_load_cand_ok = false, g_load_stall_ok = false, g_load_prev_ok = false, g_load_low = false;
+LoadSnap g_load_prev, g_load_prev2, g_load_cand, g_load_last_stall;   // prev2: one frame further back
+bool g_load_cand_ok = false, g_load_cand_stall = false, g_load_stall_ok = false, g_load_prev_ok = false, g_load_prev2_ok = false;
+bool g_load_low = false, g_load_prev_stalled = false;
 bool load_log_on() {
     static const bool on = config_get_bool("diag", "load_log", true);
     return on;
@@ -675,11 +676,11 @@ std::string load_line(const LoadEpisode& ep) {
     snprintf(t, sizeof t, "; summed over all threads: write-fault handler %.2f s, write-watch arming %.2f s, memory pool imports %.2f s; "
              "page faults +%u", sec(kHpFaults), sec(kHpWwArm), sec(kHpPoolImport), static_cast<uint32_t>(b.faults - a.faults));
     out += t;
-    const size_t ns = g_nsrc.load(std::memory_order_acquire);
+    const size_t ns = std::min(a.ns, b.ns);
     bool any = false;
     for (size_t i = 0; i < ns; i++) {
         if (!g_src[i].counter || b.val[i] <= a.val[i]) continue;
-        out += any ? ", " : "; during it: ";
+        out += any ? ", " : "; during it (counters, all threads): ";
         out += g_src[i].label;
         snprintf(t, sizeof t, " +%llu", static_cast<unsigned long long>(b.val[i] - a.val[i]));
         out += t;
@@ -697,7 +698,7 @@ void load_episode_tick() {
         if (!g_load_ep.open || !g_load_ep.end_ms || GetTickCount64() - g_load_ep.end_ms < kLoadQuietMs) return;
         line = load_line(g_load_ep);
         g_load_ep.open = false;
-        g_load_prev_ok = false;                    // the next frame takes a fresh one
+        g_load_prev_ok = g_load_prev2_ok = false;  // the next frames take fresh ones
         g_load_cand_ok = false;
         g_load_ep_open.store(false, std::memory_order_relaxed);
     }
@@ -728,17 +729,34 @@ void note_load_frame(bool low, bool stalled) {
             g_load_stall_ok = true;
         }
     } else {
-        // the start of a possible load: the frame before the first frame of a low-draw run, or before a stall inside one (a menu
-        // that then loads); a candidate over 1.5 s old that led to no load is replaced
-        if (!low) g_load_cand_ok = false;
-        else if ((!g_load_low || stalled) && g_load_prev_ok &&
-                 (!g_load_cand_ok || static_cast<double>(qpc() - g_load_cand.qpc) / qpc_freq() > 1.5)) {
+        // The start of a possible load: the frame before the first frame of a low-draw run (two frames back when the frame before it
+        // stalled on a full frame: the game froze on the area's last frame), or before a stall inside one (a menu that then loads).
+        // A candidate with no stall in it is replaced by a stall, and one over 1.5 s old that led to no load by the next.
+        if (!low) {
+            g_load_cand_ok = false;
+        } else if (!g_load_low) {
+            const bool back2 = g_load_prev_stalled && g_load_prev2_ok;
+            if (back2 || g_load_prev_ok) {
+                g_load_cand = back2 ? g_load_prev2 : g_load_prev;
+                g_load_cand_ok = true;
+                g_load_cand_stall = back2 || stalled;
+            }
+        } else if (stalled && g_load_prev_ok &&
+                   (!g_load_cand_ok || !g_load_cand_stall || static_cast<double>(qpc() - g_load_cand.qpc) / qpc_freq() > 1.5)) {
             g_load_cand = g_load_prev;
             g_load_cand_ok = true;
+            g_load_cand_stall = true;
         }
+        g_load_prev2 = g_load_prev;
+        g_load_prev2_ok = g_load_prev_ok;
         load_snap(g_load_prev);
         g_load_prev_ok = true;
+        if (stalled) {                     // the stall that starts a load comes before it opens: the end may be this one
+            g_load_last_stall = g_load_prev;
+            g_load_stall_ok = true;
+        }
     }
+    g_load_prev_stalled = stalled;
     g_load_low = low;
 }
 
@@ -754,7 +772,7 @@ void note_loading(bool loading) {
                 if (g_load_cand_ok) ep.start = g_load_cand;
                 else load_snap(ep.start);
                 g_load_cand_ok = false;
-                g_load_stall_ok = false;
+                g_load_stall_ok = g_load_stall_ok && g_load_last_stall.qpc >= ep.start.qpc;
                 g_load_ep_open.store(true, std::memory_order_relaxed);
             }
             ep.parts++;
