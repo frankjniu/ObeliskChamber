@@ -10,8 +10,10 @@
 //   by code: pf_by_exe (ObeliskChamber.exe: the lifted game and our runtime), pf_by_driver (the GPU driver and the Vulkan loader),
 //     pf_by_system (ntdll, kernel32/kernelbase, the C runtime), pf_by_kernel (kernel mode: file reads into user buffers, the driver's
 //     kernel part), pf_by_other (any other module)
-//   pf_seen (every fault recorded) and pf_lost (faults the kernel's buffer dropped before a drain): pf_seen against the `load` line's
-//     page faults is the coverage.
+//   pf_seen (every fault recorded) and pf_lost (faults the kernel's buffer dropped before a drain). The `load` line's page faults count
+//     more: also faults that add no page, and faults during a query, which the watch does not record, so pf_seen + pf_lost is lower
+//     even with nothing lost. pf_host also holds the heap's private views (GPU imports) and the zeroed pages for unmapped guest reads
+//     below 4 GiB, whose addresses Windows picks.
 // Every 60 s a log line lists the instructions with the most faults (module + offset: look them up in the .map file).
 // Diagnostics only: the watch makes every page fault a little slower. Off by default. Read once.
 #include "nxrt/gauge.h"
@@ -73,9 +75,18 @@ int name_class(std::string n) {
 }
 
 // The module holding `pc`, from a cache of module ranges (the drain thread only).
-const Module* module_of(std::vector<Module>& mods, uint64_t pc) {
+const Module* module_of(std::vector<Module>& mods, std::vector<uint64_t>& misses, uint64_t pc) {
     for (const Module& m : mods)
         if (pc >= m.base && pc < m.end) return &m;
+    // Code outside any image (driver-generated code, hooks): remembered by 64 KiB granule, and VirtualQuery first, so the loader lock
+    // (GetModuleHandleExW) is not taken again for it while a DLL loads.
+    const uint64_t gran = pc >> 16;
+    if (std::find(misses.begin(), misses.end(), gran) != misses.end()) return nullptr;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(reinterpret_cast<const void*>(pc), &mbi, sizeof mbi) || mbi.Type != MEM_IMAGE) {
+        if (misses.size() < 4096) misses.push_back(gran);
+        return nullptr;
+    }
     HMODULE h = nullptr;
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                             reinterpret_cast<LPCWSTR>(pc), &h) || !h)
@@ -97,21 +108,32 @@ void drain_loop() {
     std::vector<PSAPI_WS_WATCH_INFORMATION_EX> buf(1 << 16);
     std::vector<Module> mods;
     mods.reserve(256);
+    std::vector<uint64_t> misses;
+    // 2: a high-resolution waitable timer (Sleep(2) is ~15.6 ms without 1 ms timer resolution, and the kernel's buffer is small)
+    HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    int errors = 0;
     std::unordered_map<uint64_t, uint64_t> by_pc;     // faulting instruction -> faults, since the last summary
     uint64_t last_summary = GetTickCount64();
     for (;;) {
         DWORD cb = static_cast<DWORD>(buf.size() * sizeof buf[0]);
         if (!GetWsChangesEx(GetCurrentProcess(), buf.data(), &cb)) {
             const DWORD e = GetLastError();
-            if (e == ERROR_INSUFFICIENT_BUFFER) {
+            if (e == ERROR_INSUFFICIENT_BUFFER && buf.size() < (1u << 19)) {
                 buf.resize(buf.size() * 2);
                 continue;
             }
-            // ERROR_NO_MORE_ITEMS: nothing since the last call
+            if (e != ERROR_NO_MORE_ITEMS && e != ERROR_INSUFFICIENT_BUFFER) {      // NO_MORE_ITEMS: nothing since the last call
+                if (++errors == 1) NXLOG_W("faults", "GetWsChangesEx failed (%lu)", e);
+                if (errors >= 50) {
+                    NXLOG_W("faults", "[diag] fault_watch: GetWsChangesEx keeps failing (%lu); the watch stops", e);
+                    return;
+                }
+            }
         } else {
-            const size_t n = cb / sizeof buf[0];
+            errors = 0;
             uint64_t seen = 0;
-            for (size_t i = 0; i < n; i++) {
+            // up to the end-of-list entry (FaultingPc NULL), which the kernel always writes; the returned size is not documented
+            for (size_t i = 0; i < buf.size(); i++) {
                 const auto& w = buf[i];
                 const uint64_t pc = reinterpret_cast<uint64_t>(w.BasicInfo.FaultingPc);
                 const uint64_t va = reinterpret_cast<uint64_t>(w.BasicInfo.FaultingVa);
@@ -123,7 +145,7 @@ void drain_loop() {
                 g_va[va_class(va)].fetch_add(1, std::memory_order_relaxed);
                 int pcls = kPcKernel;
                 if (pc < 0x0000800000000000ull) {
-                    const Module* m = module_of(mods, pc);
+                    const Module* m = module_of(mods, misses, pc);
                     pcls = m ? m->cls : kPcOther;
                 }
                 g_pc[pcls].fetch_add(1, std::memory_order_relaxed);
@@ -143,7 +165,7 @@ void drain_loop() {
             char t[160];
             for (size_t i = 0; i < top; i++) {
                 const uint64_t pc = v[i].first;
-                const Module* m = pc < 0x0000800000000000ull ? module_of(mods, pc) : nullptr;
+                const Module* m = pc < 0x0000800000000000ull ? module_of(mods, misses, pc) : nullptr;
                 if (m) snprintf(t, sizeof t, "%s%s+0x%llx %llu", i ? ", " : "", m->name.c_str(), static_cast<unsigned long long>(pc - m->base),
                                 static_cast<unsigned long long>(v[i].second));
                 else snprintf(t, sizeof t, "%s0x%llx %llu", i ? ", " : "", static_cast<unsigned long long>(pc), static_cast<unsigned long long>(v[i].second));
@@ -153,7 +175,10 @@ void drain_loop() {
                     static_cast<unsigned long long>(total), v.size(), line.c_str());
             by_pc.clear();
         }
-        Sleep(2);
+        LARGE_INTEGER due;
+        due.QuadPart = -20000;                            // 2 ms
+        if (!timer || !SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) Sleep(1);
+        else WaitForSingleObject(timer, INFINITE);
     }
 }
 
@@ -183,7 +208,7 @@ void fault_watch_start() {
     hitch_add_counter("pf_by_other", [] { return rd(g_pc[kPcOther]); });
     std::thread th([] {
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
-        SetThreadDescription(GetCurrentThread(), L"fault-watch");
+        log_set_thread_name("fault-watch");
         drain_loop();
     });
     th.detach();

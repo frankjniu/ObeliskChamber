@@ -49,7 +49,7 @@ double qpc_freq() {
 }
 
 // ---- hitch log -------------------------------------------------------------------------------------------------------------
-constexpr size_t kMaxSources = 64;   // 33 were registered by 2026-11-25: with 32 the last one was silently left out
+constexpr size_t kMaxSources = 64;   // 33 were registered by 2026-11-25 (with 32 the last was silently left out), 47 with [diag] fault_watch
 struct Source {
     const char* label = nullptr;
     uint64_t (*counter)() = nullptr;     // cumulative; shown as growth during the frame
