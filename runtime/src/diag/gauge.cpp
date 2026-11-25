@@ -161,11 +161,11 @@ std::string format_event(const HitchEvent& ev, size_t others) {
     char b[400];
     snprintf(b, sizeof b, "frame %llu took %.1f ms (t=%.1f s)", (unsigned long long)ev.frame, ev.ms, ev.at_s);
     std::string out = b;
-    const size_t ns = g_nsrc.load(std::memory_order_acquire);
+    const size_t ns = std::min(a.ns, b.ns);
     bool any = false;
     for (size_t i = 0; i < ns; i++) {
         if (ev.val[i] == 0) continue;
-        out += any ? ", " : "; during it: ";
+        out += any ? ", " : "; during it (counters, all threads): ";
         out += g_src[i].label;
         snprintf(b, sizeof b, " %s%lld", g_src[i].counter ? "+" : "=", (long long)ev.val[i]);
         out += b;
@@ -605,6 +605,7 @@ struct LoadSnap {
     uint64_t phase[kHpCount] = {};
     uint64_t val[kMaxSources] = {};
     uint64_t faults = 0, game_cycles = 0, tsc = 0;
+    size_t ns = 0;                // sources registered at the snapshot (one added later is left out of the growth)
 };
 struct LoadEpisode {
     bool open = false;
@@ -617,11 +618,22 @@ std::mutex g_load_mu;
 LoadEpisode g_load_ep;
 std::atomic<bool> g_load_ep_open{false};
 uint64_t g_load_ep_count = 0;   // episodes so far (under g_load_mu)
+// note_loading(true) comes on the third low-draw frame of a stall, so the start is taken earlier: `g_load_prev` is the state at the
+// previous frame (taken at every frame outside a load), copied to `g_load_cand` at the first frame of a low-draw run or at a stall in
+// one; the stall before the first loading frame is then in the line. The end is the last stall (`g_load_last_stall`) when the load ends on a light
+// screen that kept presenting (pacing comes back 1.5 s later), or the frame itself when an area frame ends it.
+LoadSnap g_load_prev, g_load_cand, g_load_last_stall;
+bool g_load_cand_ok = false, g_load_stall_ok = false, g_load_prev_ok = false, g_load_low = false;
+bool load_log_on() {
+    static const bool on = config_get_bool("diag", "load_log", true);
+    return on;
+}
 
 void load_snap(LoadSnap& sn) {
     sn.qpc = qpc();
     for (int i = 0; i < kHpCount; i++) sn.phase[i] = g_phase[i].load(std::memory_order_relaxed);
     const size_t ns = g_nsrc.load(std::memory_order_acquire);
+    sn.ns = ns;
     for (size_t i = 0; i < ns; i++) sn.val[i] = g_src[i].counter ? g_src[i].counter() : 0;
     sn.faults = process_faults();
     sn.game_cycles = game_cycles();
@@ -633,7 +645,7 @@ std::string load_line(const LoadEpisode& ep) {
     const LoadSnap& b = ep.end;
     const double total_s = static_cast<double>(b.qpc - a.qpc) / qpc_freq();
     auto sec = [&](int p) { return static_cast<double>(b.phase[p] - a.phase[p]) / qpc_freq(); };
-    char t[256];
+    char t[512];
     std::string out;
     snprintf(t, sizeof t, "load %llu: %.2f s in %u loading screen%s", static_cast<unsigned long long>(ep.number), total_s, ep.parts,
              ep.parts == 1 ? "" : "s");
@@ -648,10 +660,10 @@ std::string load_line(const LoadEpisode& ep) {
     if (cpu_s >= 0) snprintf(t, sizeof t, "; game presenting thread: on the CPU %.2f s", cpu_s);
     else snprintf(t, sizeof t, "; game presenting thread: on the CPU (unknown)");
     out += t;
-    snprintf(t, sizeof t, ", in system calls %.2f s (IPC and file reads %.2f, waits %.2f)", sec(kHpGameSvc), sec(kHpGameIpc),
+    snprintf(t, sizeof t, ", in system calls %.2f s (IPC and file reads %.2f, waits %.2f; the CPU part of system calls is in both)", sec(kHpGameSvc), sec(kHpGameIpc),
              sec(kHpGameWait));
     out += t;
-    snprintf(t, sizeof t, "; GPU sync waits (all game threads) %.2f s, present back pressure %.2f s", sec(kHpGameSyncWait),
+    snprintf(t, sizeof t, "; GPU sync waits (summed over the game's threads) %.2f s, present back pressure %.2f s", sec(kHpGameSyncWait),
              sec(kHpGameBackpressure));
     out += t;
     snprintf(t, sizeof t, "; render thread: replay %.2f s (uploads %.2f [take %.2f, prepare %.2f, staging %.2f], image creation %.2f, "
@@ -660,8 +672,8 @@ std::string load_line(const LoadEpisode& ep) {
              sec(kHpRenderImage), sec(kHpRenderPipeline), sec(kHpRenderGpuWait), sec(kHpRenderLockWait), sec(kHpRenderPresent),
              sec(kHpRenderLimiter), sec(kHpRenderIdle));
     out += t;
-    snprintf(t, sizeof t, "; any thread: write-fault handler %.2f s, memory pool imports %.2f s; page faults +%llu", sec(kHpFaults),
-             sec(kHpPoolImport), static_cast<unsigned long long>(b.faults >= a.faults ? b.faults - a.faults : 0));
+    snprintf(t, sizeof t, "; summed over all threads: write-fault handler %.2f s, write-watch arming %.2f s, memory pool imports %.2f s; "
+             "page faults +%u", sec(kHpFaults), sec(kHpWwArm), sec(kHpPoolImport), static_cast<uint32_t>(b.faults - a.faults));
     out += t;
     const size_t ns = g_nsrc.load(std::memory_order_acquire);
     bool any = false;
@@ -685,15 +697,53 @@ void load_episode_tick() {
         if (!g_load_ep.open || !g_load_ep.end_ms || GetTickCount64() - g_load_ep.end_ms < kLoadQuietMs) return;
         line = load_line(g_load_ep);
         g_load_ep.open = false;
+        g_load_prev_ok = false;                    // the next frame takes a fresh one
+        g_load_cand_ok = false;
         g_load_ep_open.store(false, std::memory_order_relaxed);
     }
     NXLOG_I("load", "%s", line.c_str());
 }
 }  // namespace
 
+void load_log_flush() {
+    if (!g_load_ep_open.load(std::memory_order_relaxed)) return;
+    std::string line;
+    {
+        std::lock_guard<std::mutex> lk(g_load_mu);
+        if (!g_load_ep.open) return;
+        if (!g_load_ep.end_ms) load_snap(g_load_ep.end);      // still on a loading screen: up to now
+        line = load_line(g_load_ep) + " (logged at exit)";
+        g_load_ep.open = false;
+        g_load_ep_open.store(false, std::memory_order_relaxed);
+    }
+    NXLOG_I("load", "%s", line.c_str());
+}
+
+void note_load_frame(bool low, bool stalled) {
+    if (!load_log_on()) return;
+    std::lock_guard<std::mutex> lk(g_load_mu);
+    if (g_load_ep.open) {
+        if (stalled) {
+            load_snap(g_load_last_stall);
+            g_load_stall_ok = true;
+        }
+    } else {
+        // the start of a possible load: the frame before the first frame of a low-draw run, or before a stall inside one (a menu
+        // that then loads); a candidate over 1.5 s old that led to no load is replaced
+        if (!low) g_load_cand_ok = false;
+        else if ((!g_load_low || stalled) && g_load_prev_ok &&
+                 (!g_load_cand_ok || static_cast<double>(qpc() - g_load_cand.qpc) / qpc_freq() > 1.5)) {
+            g_load_cand = g_load_prev;
+            g_load_cand_ok = true;
+        }
+        load_snap(g_load_prev);
+        g_load_prev_ok = true;
+    }
+    g_load_low = low;
+}
+
 void note_loading(bool loading) {
-    static const bool log_loads = config_get_bool("diag", "load_log", true);
-    if (log_loads) {
+    if (load_log_on()) {
         std::lock_guard<std::mutex> lk(g_load_mu);
         LoadEpisode& ep = g_load_ep;
         if (loading) {
@@ -701,13 +751,17 @@ void note_loading(bool loading) {
                 ep = LoadEpisode{};
                 ep.open = true;
                 ep.number = ++g_load_ep_count;
-                load_snap(ep.start);
+                if (g_load_cand_ok) ep.start = g_load_cand;
+                else load_snap(ep.start);
+                g_load_cand_ok = false;
+                g_load_stall_ok = false;
                 g_load_ep_open.store(true, std::memory_order_relaxed);
             }
             ep.parts++;
             ep.end_ms = 0;
         } else if (ep.open) {
-            load_snap(ep.end);
+            if (g_load_low && g_load_stall_ok) ep.end = g_load_last_stall;   // ended on a light screen: the load ended at its last stall
+            else load_snap(ep.end);
             ep.end_ms = GetTickCount64();
         }
     }
@@ -762,16 +816,27 @@ void hitch_note_game_present() {
     while (d > m && !g_game_gap_max.compare_exchange_weak(m, d, std::memory_order_relaxed)) {}
 }
 
+namespace {
+std::mutex g_src_mu;
+void src_overflow(const char* label) {
+    static std::atomic<bool> once{false};
+    if (!once.exchange(true)) NXLOG_W("hitch", "hitch line: more than %zu counters, '%s' and any later ones are left out", kMaxSources, label ? label : "?");
+}
+}  // namespace
 void hitch_add_counter(const char* label, uint64_t (*fn)()) {
+    std::lock_guard<std::mutex> lk(g_src_mu);     // sources also register lazily, from any thread
     const size_t i = g_nsrc.load();
-    if (i >= kMaxSources || !fn) return;
+    if (!fn) return;
+    if (i >= kMaxSources) { src_overflow(label); return; }
     g_src[i] = {label, fn, nullptr};
     g_nsrc.store(i + 1, std::memory_order_release);
 }
 
 void hitch_add_level(const char* label, int64_t (*fn)()) {
+    std::lock_guard<std::mutex> lk(g_src_mu);     // sources also register lazily, from any thread
     const size_t i = g_nsrc.load();
-    if (i >= kMaxSources || !fn) return;
+    if (!fn) return;
+    if (i >= kMaxSources) { src_overflow(label); return; }
     g_src[i] = {label, nullptr, fn};
     g_nsrc.store(i + 1, std::memory_order_release);
 }

@@ -496,6 +496,7 @@ void vib_sink(uint32_t slot, int hand, const hid::VibrationValue& v, void*) {
         st.dirty = false;
     }
     nvn::backend_flush_caches();                    // the pipeline cache; this path does not shut the back end down
+    nxrt::load_log_flush();                         // a load still open: its breakdown line
     nxrt::session_log("session at exit");          // the whole session's frame times (fps, 1% and 0.1% lows)
     nxrt::log_flush();
     nxrt::profile_flush();                          // profile-guided builds: the counters (TerminateProcess skips the profile runtime's atexit)

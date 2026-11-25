@@ -236,16 +236,16 @@ GaugeCounter g_bytes_read("fs.bytes_read");   // bytes returned by IFile::Read s
 // Reads of files and of the RomFS storage, for the hitch line and the load breakdown ([diag] load_log): KiB read and the time the
 // reads themselves took (the host read, not the IPC around it; the game's decompression is guest code and not in it).
 std::atomic<uint64_t> g_read_bytes{0};
-std::atomic<uint64_t> g_read_us{0};
+std::atomic<uint64_t> g_read_ns{0};
 const bool g_read_hitch = (nxrt::hitch_add_counter("fs_read_kb", []() -> uint64_t { return g_read_bytes.load(std::memory_order_relaxed) >> 10; }),
-                           nxrt::hitch_add_counter("fs_read_ms", []() -> uint64_t { return g_read_us.load(std::memory_order_relaxed) / 1000; }),
+                           nxrt::hitch_add_counter("fs_read_ms", []() -> uint64_t { return g_read_ns.load(std::memory_order_relaxed) / 1000000; }),
                            true);
 // Times one read into the two counters above.
 struct ReadTimer {
     std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
     void done(uint64_t bytes) {
-        const auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
-        g_read_us.fetch_add(static_cast<uint64_t>(us), std::memory_order_relaxed);
+        const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+        g_read_ns.fetch_add(static_cast<uint64_t>(ns), std::memory_order_relaxed);
         g_read_bytes.fetch_add(bytes, std::memory_order_relaxed);
     }
 };

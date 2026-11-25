@@ -128,6 +128,11 @@ struct LoadInfo {
     uint32_t last_draws = 0;        // draws of the last presented frame (a loading tip or menu has a few dozen, an area hundreds)
 };
 void note_loading(bool loading);
+// Every presented frame, from the same place, before note_loading, for the load breakdown ([diag] load_log): `low` = a frame with few
+// draws (a loading screen or a menu), `stalled` = it came over 100 ms after the previous present. Render thread.
+void note_load_frame(bool low, bool stalled);
+// Logs the load breakdown line of a load that is still open (the process is ending).
+void load_log_flush();
 // The draws of each presented frame, from the same place (for `@loaded draws=<n>`). Any thread, lock-free.
 void note_frame_draws(uint32_t draws);
 LoadInfo load_info();
