@@ -12,8 +12,9 @@
 use super::{cpu, dump, jobs_of, nup, nup_dir, paths, settings, setup, Config};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// True when the command line asks for the headless setup.
 pub fn wanted(args: &[String]) -> bool {
@@ -44,11 +45,72 @@ fn progress(fraction: f64, text: &str) {
     say(&format!("progress {:.3} {}", fraction.clamp(0.0, 1.0), text));
 }
 
-/// The reason, as the last line the step prints, and the failure exit code.
+/// The reason and the failure exit code. A reason of several lines (a step's message with the tail of its output) is printed whole,
+/// then its first line again: RecompLauncher shows the last lines the step printed, and the player reads the last one first.
 fn fail(reason: &str) -> i32 {
-    let line = reason.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("Set up did not finish.");
-    say(line);
+    let lines: Vec<&str> = reason.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let Some(first) = lines.first() else {
+        say("Set up did not finish. See setup.log in the game's folder.");
+        return 1;
+    };
+    if lines.len() > 1 {
+        for l in &lines {
+            say(l);
+        }
+    }
+    say(first);
     1
+}
+
+/// The launcher's own options that change what Set up builds (its Settings page: build processes, the decompiled lighting shader
+/// box), read from its launcher.json in the app config folder as Tauri keeps it, without Tauri. A player who uses both launchers
+/// then gets the same build from either; without the file, the defaults.
+fn launcher_options(cfg: &mut Config) {
+    const ID: &str = "io.github.goldoire.fefw-launcher";   // tauri.conf.json "identifier"
+    let base = if cfg!(windows) {
+        std::env::var_os("APPDATA").map(PathBuf::from)
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+    };
+    let Some(file) = base.map(|b| b.join(ID).join("launcher.json")) else { return };
+    let Ok(text) = std::fs::read_to_string(file) else { return };
+    let Ok(own) = serde_json::from_str::<Config>(&text) else { return };
+    cfg.jobs = own.jobs;
+    cfg.lighting_edit = own.lighting_edit;
+}
+
+/// Prints the last progress line again every few minutes while a step prints nothing (the lift of main runs for a long time without a
+/// line): RecompLauncher stops a setup step that has been quiet for an hour.
+struct Heartbeat {
+    stop: Arc<AtomicBool>,
+    th: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Heartbeat {
+    fn start(last: Arc<Mutex<(f64, String, Instant)>>) -> Heartbeat {
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let th = std::thread::spawn(move || {
+            while !flag.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_secs(1));
+                let mut l = last.lock().unwrap();
+                if l.2.elapsed() >= Duration::from_secs(300) {
+                    progress(l.0, &l.1);
+                    l.2 = Instant::now();
+                }
+            }
+        });
+        Heartbeat { stop, th: Some(th) }
+    }
+}
+
+impl Drop for Heartbeat {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(t) = self.th.take() {
+            let _ = t.join();
+        }
+    }
 }
 
 fn is_nup(path: &Path) -> bool {
@@ -82,6 +144,7 @@ pub fn run(args: &[String]) -> i32 {
         return fail(&why);
     }
     let mut cfg = Config { dump_dir: game.clone(), ..Default::default() };
+    launcher_options(&mut cfg);
     // a .nup takes the first tenth of the bar; setup the rest
     let mut start = 0.0f64;
     let given = PathBuf::from(&game);
@@ -99,7 +162,7 @@ pub fn run(args: &[String]) -> i32 {
 
     // A new release runs this step again: when the game in the folder is already built for it, there is nothing to do but the paths.
     if setup::complete(&p) {
-        if let Err(e) = settings::ensure_play_paths(&p.game_dir, &p) {
+        if let Err(e) = play_paths(&p) {
             return fail(&e);
         }
         progress(1.0, "Already built");
@@ -112,7 +175,10 @@ pub fn run(args: &[String]) -> i32 {
     // the bar moves one share per step still to do, and within a step by its own count where it has one
     let todo = setup::steps(&p, None).iter().filter(|s| s.state != "done").count().max(1) as f64;
     // (the step being run, how many steps have started, the last fraction printed, the last text printed)
-    let seen: Mutex<(String, usize, f64, String)> = Mutex::new((String::new(), 0, -1.0, String::new()));
+    let seen: Mutex<(String, usize, f64, String)> = Mutex::new((String::new(), 0, start, String::new()));
+    // the last line printed and when, for the heartbeat
+    let last = Arc::new(Mutex::new((start, "Starting".to_string(), Instant::now())));
+    let _beat = Heartbeat::start(last.clone());
     let emit = |pr: setup::Progress| {
         let mut s = seen.lock().unwrap();
         if s.0 != pr.step {
@@ -123,28 +189,46 @@ pub fn run(args: &[String]) -> i32 {
         let steps_before = s.1.saturating_sub(1) as f64;
         let f = start + (1.0 - start) * ((steps_before + within) / todo).min(1.0);
         let text = pr.message.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or(&pr.step).to_string();
+        // a step's own count starts again in each of its phases (the build: verify, lift, compile, link): the bar never goes back
+        let f = f.max(s.2);
         // every update would be thousands of lines during the lift: a new message, or half a percent more, is enough
         if text != s.3 || f - s.2 >= 0.005 {
             s.2 = f;
             s.3 = text.clone();
             progress(f, &text);
+            *last.lock().unwrap() = (f, text, Instant::now());
         }
     };
-    // the setup's own log lines also go to setup.log in the game folder; RecompLauncher's full log gets the progress lines
-    let emit_log = |_lines: Vec<String>| {};
+    // the setup's own log lines (also in setup.log in the game folder): RecompLauncher keeps all the step printed for its Open Full Log
+    let emit_log = |lines: Vec<String>| {
+        for l in lines {
+            say(&l);
+        }
+        last.lock().unwrap().2 = Instant::now();
+    };
     let end = setup::run(&shared, &p, jobs_of(&cfg), &emit, &emit_log);
+    if end.state == "cancelled" {
+        // in the window this is a pause the player chose; here nothing asked for it
+        return fail("Set up stopped before it finished. See setup.log in the game's folder.");
+    }
     if end.state != "done" {
         return fail(if end.message.trim().is_empty() { "Set up did not finish. See setup.log in the game's folder." } else { &end.message });
     }
     if !setup::complete(&p) {
         return fail("Set up ended, but the game is not ready. See setup.log in the game's folder.");
     }
-    // what Play does before it starts ObeliskChamber.exe: ObeliskChamber.ini points at the dump, the saves and the caches
-    if let Err(e) = settings::ensure_play_paths(&p.game_dir, &p) {
+    if let Err(e) = play_paths(&p) {
         return fail(&e);
     }
     progress(1.0, "Ready to play");
     0
+}
+
+/// What Play does before it starts ObeliskChamber.exe (ObeliskChamber.ini points at the game code, the dump, the mods and the caches),
+/// with the paths inside the game folder written relative to it, so the folder can move (settings.rs relative_play_paths).
+fn play_paths(p: &setup::Paths) -> Result<(), String> {
+    settings::ensure_play_paths(&p.game_dir, p)?;
+    settings::relative_play_paths(&p.game_dir, p)
 }
 
 #[cfg(test)]

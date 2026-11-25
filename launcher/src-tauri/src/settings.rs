@@ -121,6 +121,31 @@ fn owned(p: &Paths) -> Vec<(&'static str, &'static str, String)> {
     ]
 }
 
+/// The paths setup owns that lie inside the game folder, rewritten relative to it ("exefs", "mods", "shader_cache/spirv", and
+/// "nup_dump/..." for an unpacked .nup), as [fs] save_dir already is. For `--prepare` (prepare.rs): RecompLauncher starts
+/// ObeliskChamber.exe in the game folder without this launcher, and can move that folder (Manage > Move) without running the
+/// setup step again, so absolute paths there would point at the old place. Paths outside the folder (a dump folder elsewhere) stay
+/// as they are. This launcher writes them absolute again before its own Play (play_paths_ok), which is harmless.
+pub fn relative_play_paths(dir: &Path, p: &Paths) -> Result<(), String> {
+    let path = game_ini(dir);
+    let Some(mut ini) = load(&path) else { return Ok(()) };
+    let prefix = format!("{}/", crate::dump::game_path(dir).trim_end_matches('/'));
+    let mut changed = false;
+    for (s, k, _) in owned(p) {
+        let v = ini.get(s, k).unwrap_or_default().replace('\\', "/");
+        let Some(rel) = v.strip_prefix(&prefix) else { continue };
+        if rel.is_empty() {
+            continue;
+        }
+        ini.set(s, k, rel);
+        changed = true;
+    }
+    if changed {
+        write_atomic(&path, &ini.to_text())?;
+    }
+    Ok(())
+}
+
 pub fn play_paths_ok(dir: &Path, p: &Paths) -> bool {
     let Some(ini) = load(&game_ini(dir)) else { return false };
     owned(p).iter().all(|(s, k, v)| ini.get(s, k).unwrap_or_default().replace('\\', "/") == *v)
@@ -202,6 +227,35 @@ pub fn ensure_play_paths(dir: &Path, p: &Paths) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn prepare_writes_the_paths_inside_the_game_folder_relative() {
+        let dir = std::env::temp_dir().join(format!("oc_relpaths_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let elsewhere = std::env::temp_dir().join("oc_relpaths_dump");
+        let p = Paths {
+            repo: dir.clone(),
+            exefs: elsewhere.join("exefs"),
+            romfs: dir.join("nup_dump").join("base").join("romfs"),
+            dlc: Some(elsewhere.join("dlc")),
+            game_dir: dir.clone(),
+            package: Some(dir.join("tools")),
+            lighting_edit: false,
+        };
+        ensure_play_paths(&dir, &p).unwrap();
+        relative_play_paths(&dir, &p).unwrap();
+        let ini = load(&game_ini(&dir)).unwrap();
+        assert_eq!(ini.get("fs", "exefs").unwrap_or_default(), "exefs");
+        assert_eq!(ini.get("fs", "romfs").unwrap_or_default(), "nup_dump/base/romfs");
+        assert_eq!(ini.get("fs", "mods").unwrap_or_default(), "mods");
+        assert_eq!(ini.get("nvn", "shader_cache").unwrap_or_default(), "shader_cache/spirv");
+        assert_eq!(ini.get("nvn", "bc7_cache").unwrap_or_default(), "shader_cache/bc7");
+        assert_eq!(ini.get("fs", "save_dir").unwrap_or_default(), "save");
+        // outside the game folder: left absolute
+        assert_eq!(ini.get("aoc", "dir").unwrap_or_default(), crate::dump::game_path(&elsewhere.join("dlc")));
+        let _ = fs::remove_dir_all(&dir);
+    }
     use super::*;
 
     fn tmp(name: &str) -> PathBuf {
