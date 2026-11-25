@@ -835,14 +835,20 @@ void hitch_note_game_present() {
 }
 
 namespace {
-std::mutex g_src_mu;
+// Registration happens during other files' static initialization too, so this is a constant-initialized spinlock: a namespace-scope
+// std::mutex may not be constructed yet then (and MSVC's constexpr mutex crashes with an older msvcp140.dll).
+std::atomic_flag g_src_lock = ATOMIC_FLAG_INIT;
+struct SrcLock {
+    SrcLock() { while (g_src_lock.test_and_set(std::memory_order_acquire)) std::this_thread::yield(); }
+    ~SrcLock() { g_src_lock.clear(std::memory_order_release); }
+};
 void src_overflow(const char* label) {
     static std::atomic<bool> once{false};
     if (!once.exchange(true)) NXLOG_W("hitch", "hitch line: more than %zu counters, '%s' and any later ones are left out", kMaxSources, label ? label : "?");
 }
 }  // namespace
 void hitch_add_counter(const char* label, uint64_t (*fn)()) {
-    std::lock_guard<std::mutex> lk(g_src_mu);     // sources also register lazily, from any thread
+    SrcLock lk;                                   // sources also register lazily, from any thread
     const size_t i = g_nsrc.load();
     if (!fn) return;
     if (i >= kMaxSources) { src_overflow(label); return; }
@@ -851,7 +857,7 @@ void hitch_add_counter(const char* label, uint64_t (*fn)()) {
 }
 
 void hitch_add_level(const char* label, int64_t (*fn)()) {
-    std::lock_guard<std::mutex> lk(g_src_mu);     // sources also register lazily, from any thread
+    SrcLock lk;                                   // sources also register lazily, from any thread
     const size_t i = g_nsrc.load();
     if (!fn) return;
     if (i >= kMaxSources) { src_overflow(label); return; }
