@@ -1053,6 +1053,12 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
             if (fams[queue_family_].queueCount > 1 + fg_queues) async_index = 1 + fg_queues;
             else NXLOG_I(kTag, "async compute: off (the graphics family has %u queue(s), none to spare)", fams[queue_family_].queueCount);
         }
+        // one line whatever the outcome (a laptop run with auto logged nothing here: which part said no)
+        NXLOG_I(kTag, "async compute: [gfx] async_compute = '%s', vendor 0x%04x, family %u of %u, %u queue(s) in it, %u for frame generation -> %s",
+                ac.c_str(), props_.vendorID, queue_family_, nfam, queue_family_ < nfam ? fams[queue_family_].queueCount : 0u, fg_queues,
+                async_index ? "on" : !want ? "off (setting or vendor)" : "off (no queue to spare or no family)");
+    } else {
+        NXLOG_I(kTag, "async compute: off (headless)");
     }
     const float prio[8] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
     float qprio[8];
