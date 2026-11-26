@@ -777,6 +777,11 @@ TexGpu* create_texture_gpu(Texture* t, float want_scale) {
     g->layers = s.layers;
     g->cube = s.cube;
     g->seen_ms.store(resid_ms(), std::memory_order_relaxed);   // [gfx] residency: a new image counts as used
+    // every image made (first use, retry, residency restore) tells the background jobs its format (nvn_texprep.h)
+    auto made = [&]() -> TexGpu* {
+        t->image_format.store(static_cast<uint32_t>(g->format), std::memory_order_release);
+        return g;
+    };
     auto fail = [&](const std::string& why) -> TexGpu* {
         NXLOG_E(kTag, "texture %u: no image (%s): the texture is not usable on the GPU", t->id, why.c_str());
         g->failed = true;
@@ -792,7 +797,7 @@ TexGpu* create_texture_gpu(Texture* t, float want_scale) {
         if (max_mb && (t->storage_size >> 20) > max_mb && s.type == VK_IMAGE_TYPE_2D && !s.cube && s.samples == 1 &&
             device().features().sparse_binding && device().features().sparse_residency_image2d && config_get_bool("nvn", "sparse_residency", true)) {
             std::string why;
-            if (create_sparse_texture(t, g, s, &why)) return g;
+            if (create_sparse_texture(t, g, s, &why)) return made();
             return fail("sparse residency image: " + why);
         }
         if (max_mb && (t->storage_size >> 20) > max_mb)
@@ -957,7 +962,7 @@ TexGpu* create_texture_gpu(Texture* t, float want_scale) {
     }
     g_live_images.fetch_add(1);
     counters().textures_created.fetch_add(1);
-    return g;
+    return made();
 }
 
 // The texture's image, created on first use. Null when the texture has no usable image (the failure is counted and logged once).
@@ -994,6 +999,7 @@ TexGpu* tex_or_null(Texture* t, float want_scale = 1.0f) {
             // object); what the image holds is as current for this object as for the one it was made for
             t->gpu = ag;
             ++ag->refs;
+            t->image_format.store(static_cast<uint32_t>(ag->format), std::memory_order_release);
             static const bool borrow = nxrt::config_get_bool("nvn", "finalized_borrow", true);
             if (borrow && t->released && t->destroyed.load()) {
                 // a finalized texture still drawn through a pool entry: it borrows. A borrower nothing else holds any more goes (its
@@ -2239,6 +2245,93 @@ bool tex_promote(Texture* t, Frame& f) {
     ng->promoted_ms = std::max<uint32_t>(resid_ms(), 1);
     return true;
 }
+
+// Remakes a transcoded BC5 image in place when its storage content no longer has a usable BC5 cache entry (#177).
+// Chooses the new format from the new content (RGBA8 entry, BC1 if active and opaque, or BC7) without BC5. Mutating
+// TexGpu in place keeps aliases (refs > 1), texture_detail / residency drops, and pool_texture_remade() consistent.
+bool tex_remake_from_bc5(Texture* t, TexGpu* g) {
+    if (!t || !g || g->failed || !g->transcoded || g->format != VK_FORMAT_BC5_UNORM_BLOCK || g->sparse || !g->fmt) return false;
+    Shape is = shape_of(*t);
+    is.base = g->base;
+    is.levels = g->levels;
+    is.layers = g->layers;
+    const VkFormat bc7_format = g->fmt->srgb ? VK_FORMAT_BC7_SRGB_BLOCK : VK_FORMAT_BC7_UNORM_BLOCK;
+    const VkFormat entry = cache_entry_format(*t, astc_bc1_active_impl(), texprep::async_standin(), /*allow_bc5=*/false);
+    const VkFormat want = entry != VK_FORMAT_UNDEFINED ? entry : bc7_format;
+    const VkFormat alt = entry != VK_FORMAT_UNDEFINED ? bc7_format : VK_FORMAT_UNDEFINED;
+    VkFormat chosen = VK_FORMAT_UNDEFINED;
+    for (VkFormat c : {want, alt}) {
+        if (c == VK_FORMAT_UNDEFINED || c == VK_FORMAT_BC5_UNORM_BLOCK) continue;
+        if (device().image_supported(make_desc(is, c, VK_IMAGE_USAGE_SAMPLED_BIT, base_flags(is, c)))) {
+            chosen = c;
+            break;
+        }
+    }
+    if (chosen == VK_FORMAT_UNDEFINED) return false;
+    VkImageCreateFlags flags = base_flags(is, chosen);
+    VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+    const auto add = [&](VkImageUsageFlags bit) {
+        if (device().image_supported(make_desc(is, chosen, usage | bit, flags))) usage |= bit;
+    };
+    add(VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    add(VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+    if (!is_block_format(chosen)) {
+        add(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+        add(VK_IMAGE_USAGE_STORAGE_BIT);
+        const VkFormat unorm = is_srgb(chosen) ? srgb_partner(chosen) : VK_FORMAT_UNDEFINED;
+        if (!(usage & VK_IMAGE_USAGE_STORAGE_BIT) && unorm != VK_FORMAT_UNDEFINED && (flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) &&
+            device().image_supported(make_desc(is, unorm, usage | VK_IMAGE_USAGE_STORAGE_BIT, flags))) {
+            flags |= VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+            usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+        }
+    }
+    gfx::ImageDesc nd = make_desc(is, chosen, usage, flags);
+    if (g->demoted_ms) nd.small_pool = true;
+    // [gfx] defrag: movable as create_texture_gpu makes it (a sampled-only 2D image), with its owner, so a pass can move the new image
+    nd.movable = !g->demoted_ms && !(usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT)) &&
+                 is.type == VK_IMAGE_TYPE_2D && is.samples <= 1;
+    gfx::Image ni;
+    std::string err;
+    if (device().create_image(nd, &ni, &err) != VK_SUCCESS) {
+        NXLOG_W(kTag, "texture %u: cannot remake BC5 image as VkFormat %d (%s)", t->id, static_cast<int>(chosen), err.c_str());
+        return false;
+    }
+    if (nd.movable) device().set_alloc_owner(ni.allocation, g);
+    gfx::Image old = g->img;
+    if (g->presented) device().wait_idle();
+    g->presented = false;
+    std::vector<VkImageView> views;
+    for (auto& kv : g->views) views.push_back(kv.second);
+    g->views.clear();
+    g->last_view = VK_NULL_HANDLE;
+    g->last_key = {};
+    g->sampled_formats.clear();
+    g->last_sampled_fmt = VK_FORMAT_MAX_ENUM;
+    defer_destroy([old, views]() mutable {
+        for (VkImageView v : views) { vkDestroyImageView(vkdev(), v, nullptr); vk_gauge_image_views().sub(1); }
+        device().destroy_image(old);
+    });
+    g->img = ni;
+    g->format = chosen;
+    g->usage = usage;
+    g->create_flags = flags;
+    g->mutable_fmt = srgb_partner(chosen) != VK_FORMAT_UNDEFINED || bit_alias_class(chosen);
+    g->layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    g->uploaded = false;
+    g->gpu_written = false;
+    const bool bc8 = chosen >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && chosen <= VK_FORMAT_BC1_RGBA_SRGB_BLOCK;
+    if (is_block_format(chosen))
+        g->est_bytes = estimate_image_bytes(is.base, is.levels, is.layers, is.samples, 4, 4, bc8 ? 8 : 16);
+    else
+        g->est_bytes = estimate_image_bytes(is.base, is.levels, is.layers, is.samples, 1, 1, 4);
+    t->image_format.store(static_cast<uint32_t>(chosen), std::memory_order_release);
+    for (const Ref<Texture>& b : g->borrowers)
+        b->image_format.store(static_cast<uint32_t>(chosen), std::memory_order_release);
+    pool_texture_remade(t);
+    NXLOG_I(kTag, "texture %u: BC5 image remade as VkFormat %d (%ux%u, %u levels, %u layers): content has no BC5 cache entry",
+            t->id, static_cast<int>(chosen), is.base.width, is.base.height, is.levels, is.layers);
+    return true;
+}
 }  // namespace
 
 // The figure residency acts on, in percent of the budget, and the budget (*budget_out; the test aid's when set); -1 when not known.
@@ -2297,6 +2390,8 @@ bool resid_pressure_pacing() {
     return on;
 }
 constexpr uint32_t kPromoteCooldownMs = 30000;
+
+bool tex_promote_for_test(Texture* t, Frame& f) { return tex_promote(t, f); }
 
 void tex_mark_seen(Texture* t) {
     if (t && t->gpu && !t->gpu->failed) t->gpu->seen_ms.store(resid_ms(), std::memory_order_relaxed);
@@ -3004,6 +3099,9 @@ void tex_ensure_current(Texture* t, Frame& f) {
     NXFT_MIN("tex.ensure", 30000);
     TexGpu* g = tex_or_null(t);
     if (!g || g->depth) return;
+    // Keep image_format in sync if another live alias sharing this TexGpu remade the image in place.
+    if (t->image_format.load(std::memory_order_relaxed) != static_cast<uint32_t>(g->format))
+        t->image_format.store(static_cast<uint32_t>(g->format), std::memory_order_release);
     if (t->b.samples > 1 || target_is_multisample(t->b.target)) return;   // multisampled images are only ever rendered
     if (t->overflow) {   // host-backed storage (nvn_core.h): no bytes in the game's memory; the image starts cleared, then only the GPU writes it
         t->cpu_dirty.store(false);
@@ -3174,6 +3272,27 @@ void tex_ensure_current(Texture* t, Frame& f) {
         g_rt_prep_bytes.fetch_add(prep.data.size(), std::memory_order_relaxed);
         if (prep.provisional) g_rt_standin_bytes.fetch_add(prep.data.size(), std::memory_order_relaxed);
         else if (ok && !prep.transcoded) g_rt_untile_bytes.fetch_add(prep.data.size(), std::memory_order_relaxed);   // BCn / uncompressed: a CPU untile
+    }
+    // A BC5 image whose storage was rewritten with content that has no readable BC5 cache entry (#177): remake the image in a format
+    // chosen from the new content (BC7, BC1, or an RGBA8 entry) and prepare again, rather than clearing the texture to zero.
+    if (g->transcoded && g->format == VK_FORMAT_BC5_UNORM_BLOCK && ((!ok && prep.bc5_unavailable) || (ok && prep.format != g->format))) {
+        if (tex_remake_from_bc5(t, g)) {
+            if (staged) {
+                device().destroy_buffer(staged);
+                staged = gfx::Buffer{};
+            }
+            reset_prep();
+            from_job = false;
+            caps.image_format = g->format;
+            caps.provisional = texprep::wants_provisional(t);
+            caps.standin_first = caps.provisional && !texprep::exact_thread() && (!t->vpool || !g->uploaded) && texprep::async_standin();
+            static const bool standin_rows = nxrt::config_get_bool("nvn", "standin_rows", true);
+            caps.compact_standin = caps.standin_first && standin_rows && !g->sparse;
+            nxrt::HitchTimer ht_prep(nxrt::kHpRenderTexPrep);
+            ok = prepare_texture(*t, caps, prep);
+            g_rt_prep_bytes.fetch_add(prep.data.size(), std::memory_order_relaxed);
+            if (prep.provisional) g_rt_standin_bytes.fetch_add(prep.data.size(), std::memory_order_relaxed);
+        }
     }
     // [gfx] astc_gpu (nvn_astc_gpu.h): the texture came as its ASTC blocks. The GPU decodes and encodes them in this submission, or, when the
     // present's budget is used up, in a later one: the image then shows the CPU's quick stand-in until its turn, or what it showed before.
