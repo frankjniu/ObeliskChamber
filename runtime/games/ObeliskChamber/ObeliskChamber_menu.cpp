@@ -1420,7 +1420,7 @@ void game_page(UiHost& host, Menu& m) {
     if (begin_rows("mov")) {
         constexpr const char* kNames[] = {"Play them (AV1 on the CPU)", "Skip them"};
         constexpr const char* kVals[] = {"host", "skip"};
-        ini_combo_row(m, *ini_key("media", "movies"), "Movies", "The game's movies are decoded on the CPU (dav1d). Skip makes each one end at once, as a skip does.",
+        ini_combo_row(m, *ini_key("media", "movies"), "Movies", "The game's movies are decoded on the CPU (dav1d). Skip ends each one at once, as if it had played out.",
                       kNames, kVals, 2);
         end_rows();
     }

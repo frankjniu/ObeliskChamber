@@ -21,8 +21,8 @@
 // Layouts (SDK 22.2): VideoFrame +0x08 buffer, +0x28 / +0x30 bytes of luma / chroma written, +0x48 buffer size, +0x78 time, +0x88 end of
 // stream (u8); nn::movie::Buffer +0x00 data, +0x10 bytes, +0x18 time, +0x20 flags (8: end of stream). The host state hangs off the guest
 // object's first word (where the library keeps its own), with a marker in the second.
-//   [media] movies = host | skip          host (default for a title with game::Info::movie_video_decoder); skip: every movie fails to open
-//                                         and the game moves on as after a skip (core/switch2.cpp)
+//   [media] movies = host | skip          host (default for a title with game::Info::movie_video_decoder); skip: each movie ends at its first
+//                                         packet, nothing decoded, and the game moves on as when a movie plays out (vd_decode_async)
 //   [media] video_decoder_threads = 0     dav1d worker threads per decoder; 0 (default): half the logical processors, 4 to 8
 //   [media] video_decoder_frame_delay = 0 dav1d max_frame_delay; 0 (default): ceil(sqrt(threads)) frames in flight for frame-level parallelism;
 //                                         1: single-frame low-latency mode (tile parallelism only)
@@ -147,6 +147,8 @@ int g_frame_delay = 0;                      // dav1d max_frame_delay ([media] vi
 size_t g_ahead = 30;                        // decoded pictures held in dav1d's pool while no frame is free ([media] video_decode_ahead)
 int g_priority = THREAD_PRIORITY_ABOVE_NORMAL;   // of the decode worker and dav1d's task threads ([media] video_decoder_priority)
 bool g_movie_clock = false;                 // [media] movie_clock (off by default: FE:FW paces frames by timestamp)
+bool g_skip = false;                        // [media] movies = skip: each movie ends at its first packet (vd_decode_async)
+std::atomic<int> g_skipped_logged{0};
 std::atomic<int> g_dav1d_threads{0};        // dav1d task threads alive (numbers their names)
 
 // The calling thread as a movie decoder thread: its priority, no power throttling (EcoQoS would clock it down on a hybrid or a laptop CPU),
@@ -777,6 +779,25 @@ void vd_decode_async(::Ctx* c) {   // (self, const nn::movie::Buffer*)
     const uint32_t flags = rd32(buf + kBufFlags);
     {
         std::unique_lock<std::mutex> lk(d->mu);
+        if (g_skip) {
+            // The first packet since the start or the last Flush becomes the end of the stream; the rest are dropped. The worker turns
+            // it into an end-of-stream frame without opening dav1d.
+            if (!d->eos_queued) {
+                Packet k;
+                k.eos = true;
+                d->queue.push_back(std::move(k));
+                d->eos_queued = true;
+                ++d->packets;
+                if (g_skipped_logged.fetch_add(1, std::memory_order_relaxed) < 16) NXLOG_I(kTag, "[media] movies = skip: a movie ended at its first packet");
+            }
+            // Keep asking for input so the demuxer never waits on this track: once eos_queued is set, input_has_room says no, and a
+            // demuxer blocked on video would hold back the sound track too.
+            d->in_ready.signal();
+            lk.unlock();
+            d->cv.notify_all();
+            RET(0);
+            return;
+        }
         if (n && data) {
             Packet k;
             k.data.assign(reinterpret_cast<const uint8_t*>(data), reinterpret_cast<const uint8_t*>(data) + n);
@@ -946,10 +967,10 @@ bool install_movie_decoder_hle() {
     std::call_once(once, [] {
         const game::Info& gi = game::info();
         if (gi.platform != game::Platform::Switch2 || !gi.movie_video_decoder) return;
-        if (config_get_str("media", "movies", "host") == "skip") {
-            NXLOG_I(kTag, "[media] movies = skip: every movie fails to open and is skipped");
-            return;
-        }
+        // skip: the decoder is installed as for host, but it answers each movie's first packet with the end of the stream and decodes
+        // nothing, so the player ends the movie as when it plays out. Failing the open instead (as before) crashed on movies whose event
+        // code does not check it: MV40_23, on touching an obelisk in the Obelisk Chamber (#233).
+        g_skip = config_get_str("media", "movies", "host") == "skip";
         g_log = config_get_bool("media", "video_decoder_log", false);
         const int64_t auto_threads = std::clamp<int64_t>(static_cast<int64_t>(nxrt::host_threads()) / 2, 4, 8);
         const int64_t threads = config_get_int("media", "video_decoder_threads", 0);
@@ -973,6 +994,11 @@ bool install_movie_decoder_hle() {
             module_override_symbol(im.name);
         }
         g_enabled = true;
+        if (g_skip) {
+            NXLOG_I(kTag, "[media] movies = skip: movie::VideoDecoder on the host ends every movie at its first packet (nothing decoded), %zu imports routed",
+                    sizeof kImports / sizeof kImports[0]);
+            return;
+        }
         Dav1dSettings probe;
         dav1d_default_settings(&probe);
         probe.n_threads = g_threads;
