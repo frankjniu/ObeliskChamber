@@ -25,6 +25,9 @@ bool has_panels();
 // calling game thread's Ctx, add_panel otherwise. What every mod's api->open_list / api->add_panel points to.
 int list_or_panel(void* a, void* b, void* c);
 
+// This runtime's named interfaces (version 6): obeliskchamber.list. load_dll_mods calls it before any mod loads; any later call does nothing.
+void register_interfaces();
+
 // The overlay says whether a panel is on screen (api->panel_visible)
 void set_panel_visible(bool visible);
 

@@ -58,12 +58,20 @@
  *     tab (add_panel, panel_visible), drawn with simple widgets (NxModUi). The same calls, at the same places in NxModApi, as
  *     EmblemWeave's mod API version 4, so a mod written for either runtime's panels works in both: see "Two version 4s" below.
  *
+ *   - (version 6) ask for a named interface table (get_interface): a lookup by name and version, so a feature is discovered
+ *     instead of inferred from the API version. Interface tables start with size and version and grow only at the end; names are
+ *     ASCII, case-sensitive and owned by a project prefix. This runtime answers "nxp.nxmod" (version 1: this table itself, so a
+ *     plugin built on a shared layer such as Trinity reaches hooks, guest calls, memory and file edits) and "obeliskchamber.list"
+ *     (version 1, NxModListApi: open_list). Version 6 is the one the three ports agreed in fefw-recomp issue #165, with the same
+ *     member at the same place as EmblemWeave's version 6. Rules: docs/MOD_INTERFACES.md.
+ *
  * Two version 4s. EmblemWeave's runtime (the same lineage) also has a version 4, whose first new member, add_panel, sits where ours has
  * open_list. Both take three arguments and answer an int, and the runtime tells the two apart by the first argument: open_list is
  * given the Ctx of the calling game thread, add_panel a title, which can never be that Ctx. So in this header the member is a union
  * of the two names, and version 5 adds panel_visible where EmblemWeave has it. A mod that needs open_list checks version >= 4 and
  * that the runtime is this one (a game module that offers no list screen answers 0); a mod that needs panels checks version >= 4
- * (EmblemWeave) or >= 5 (this runtime): both work in both.
+ * (EmblemWeave) or >= 5 (this runtime): both work in both. From version 6 a mod asks for open_list by name instead
+ * (get_interface(api, "obeliskchamber.list", 1)), which is NULL on the other ports: the shared member stays for mods built before.
  *
  * Loading can be turned off with [fs] dll_mods = false. A DLL runs with the same rights as the game: install only mods you trust.
  */
@@ -78,12 +86,15 @@
 extern "C" {
 #endif
 
-#define NXMOD_API_VERSION 5u
+#define NXMOD_API_VERSION 6u
 
 typedef void (*NxModInlineFn)(Ctx* c, uint64_t addr, void* user);
 typedef int (*NxModSiteFn)(Ctx* c, uint64_t addr, void* user);   /* midhook / entry hook: nonzero = handled (nxrt/hooks.h) */
 typedef void (*NxModFrameFn)(Ctx* c, void* user);
 typedef void (*NxModFunctionFn)(Ctx* c, void* user);   /* a function the game calls: arguments in c->x[0..7], the result goes in c->x[0] */
+struct NxModApi;
+/* (version 6) the interface table named `name`, or NULL: see NxModApi::get_interface */
+typedef const void* (*NxModGetInterfaceFn)(const struct NxModApi* api, const char* name, uint32_t version);
 
 
 /* A game data file being set up (version 3, edit_file). data/size is the content as it stands: the game's file, or the file an
@@ -240,7 +251,23 @@ typedef struct NxModApi {
 
     /* 1 while a mod's panel is on screen (the Mods window, or the menu's Mods tab; the game gets no input meanwhile). Any thread. */
     int (*panel_visible)(void);
+
+    /* ---- version 6 (check api->version >= 6 and api->size before use; the same member at the same place as EmblemWeave's) ---- */
+
+    /* The interface table named `name` (docs/MOD_INTERFACES.md), or NULL. Version 0 asks for any compatible version; a version newer
+     * than the table this runtime provides is NULL. `get_interface(api, name, 0) != NULL` is how a mod asks whether an interface
+     * exists. "nxp.nxmod" (version 1) answers `api` itself; "obeliskchamber.list" (version 1) an NxModListApi. May be called from
+     * nxmod_early and from any thread; a returned table stays valid for the run. */
+    NxModGetInterfaceFn get_interface;
 } NxModApi;
+
+/* "obeliskchamber.list" (version 1): the list screen of version 4 (open_list), by name. size = sizeof(NxModListApi) of the runtime. */
+#define NXMOD_LIST_INTERFACE "obeliskchamber.list"
+typedef struct NxModListApi {
+    uint32_t size;
+    uint32_t version;
+    int (*open_list)(Ctx* c, uint64_t item, const struct NxModList* list);   /* as NxModApi::open_list (version 4) */
+} NxModListApi;
 
 typedef int (*NxModInitFn)(const NxModApi* api, const char* mod_dir);
 typedef int (*NxModEarlyFn)(const NxModApi* api, const char* mod_dir);   /* optional export nxmod_early (version 3) */

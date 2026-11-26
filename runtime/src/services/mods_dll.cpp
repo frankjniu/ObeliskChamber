@@ -29,6 +29,7 @@
 #include "nxrt/log.h"
 #include "nxrt/memory.h"
 #include "nxrt/mod_api.h"
+#include "nxrt/mod_interfaces.h"
 #include "nxrt/mod_panels.h"
 #include "nxrt/services_api.h"
 #include "services_internal.h"
@@ -522,6 +523,7 @@ void load_one(const std::string& mod, const std::filesystem::path& mod_dir, cons
     // open_list / add_panel: one member, two names (list_or_panel)
     m->api.add_panel = reinterpret_cast<int (*)(const char*, NxModPanelFn, void*)>(&modapi::list_or_panel);
     m->api.panel_visible = &api_panel_visible;
+    m->api.get_interface = &nxrt::nxmod::get_interface;   // version 6 (nxrt/mod_interfaces.h)
     m->init = init;
     m->dir = u8(mod_dir);
     {
@@ -632,9 +634,17 @@ bool file_edit_run(const std::string& image_path, std::vector<uint8_t>& data) {
     return changed;
 }
 
+void register_interfaces() {
+    // obeliskchamber.list (version 1): open_list by name, which in versions 4 and 5 shares its member with add_panel
+    static const NxModListApi kList = {sizeof(NxModListApi), 1, &open_list};
+    static const bool added = nxrt::nxmod::interfaces().add(NXMOD_LIST_INTERFACE, 1, &kList);
+    (void)added;
+}
+
 void load_dll_mods(uint64_t base, uint64_t frame_update) {
     if (st().loaded) return;
     st().loaded = true;
+    register_interfaces();   // before any mod can ask (nxmod_early)
     st().main_base = base;
     // a mod whose hook sites this build was not lifted with: say so on screen as well as in the log, since its hooks would never run
     for (const RomfsMod& mod : installed_mods()) {
