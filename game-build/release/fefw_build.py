@@ -940,7 +940,11 @@ def collect_mod_sites(game, build_id):
                     bid = t[1]
                     continue
                 if t[0] not in MOD_SITE_KINDS:
-                    raise Fail('%s:%d: "%s" is not a site a mod can add (%s)' % (where, ln, t[0], ', '.join(MOD_SITE_KINDS)))
+                    # A kind another port defines, or a later one: skipped with a warning rather than stopping Set up, as the three
+                    # ports agreed in fefw-recomp issue #165 (the mod's DLL decides what to do without that hook).
+                    print('warning: %s:%d: "%s" is not a site a mod can add here (%s): skipped' % (where, ln, t[0], ', '.join(MOD_SITE_KINDS)),
+                          flush=True)
+                    continue
                 try:
                     if len(t) != 2:
                         raise ValueError
