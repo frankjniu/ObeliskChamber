@@ -107,6 +107,10 @@ struct TexGpu {
     std::array<uint32_t, 12> last_key = {};             // view_for's last answer (render thread): most lookups repeat it (rt agent)
     VkImageView last_view = VK_NULL_HANDLE;
     int refs = 1;                                      // texture objects over the same storage share one image (render thread)
+    // Of those, the ones not yet released (tex_release), and the released ones that took the image afterwards to be drawn through it. A
+    // borrower holds the image only while an owner does: the last owner's release takes it from every borrower (render thread).
+    int owners = 1;
+    std::vector<Ref<Texture>> borrowers;
     struct SparseState* sparse = nullptr;               // a sparse-residency image (a big texture of a virtual pool), else null
     // CPU-streamed textures (tex_ensure_current): uploads for CPU writes that came at most kStreamGap presents apart, in a row
     uint32_t cpu_streak = 0, cpu_upload_at = 0;
@@ -990,9 +994,20 @@ TexGpu* tex_or_null(Texture* t, float want_scale = 1.0f) {
             // object); what the image holds is as current for this object as for the one it was made for
             t->gpu = ag;
             ++ag->refs;
+            static const bool borrow = nxrt::config_get_bool("nvn", "finalized_borrow", true);
+            if (borrow && t->released && t->destroyed.load()) {
+                // a finalized texture still drawn through a pool entry: it borrows. A borrower nothing else holds any more goes (its
+                // destructor gives the reference back), so a long-lived owner does not collect them.
+                auto& b = ag->borrowers;
+                b.erase(std::remove_if(b.begin(), b.end(), [](const Ref<Texture>& r) { return r->refs.load(std::memory_order_relaxed) == 1; }), b.end());
+                b.push_back(Ref<Texture>::share(t));
+            } else {
+                ++ag->owners;
+            }
             if (ag->uploaded || ag->gpu_written) t->cpu_dirty.store(false);
             static int logged = 0;
-            if (logged++ < 20) NXLOG_I(kTag, "texture %u shares the image of texture %u (the same storage)", t->id, alias->id);
+            if (logged++ < 20) NXLOG_I(kTag, "texture %u shares the image of texture %u (the same storage)%s", t->id, alias->id,
+                                       borrow && t->released ? ", borrowed by a finalized texture" : "");
             return ag;
         }
     }
@@ -3644,6 +3659,32 @@ VkSampler sampler_for(const SamplerInfo& game_sampler) {
     return v;
 }
 
+static std::atomic<uint64_t> g_borrows_ended{0};   // finalized textures whose borrowed image went with its last owner (tex_release)
+
+void tex_release(Texture* t) {
+    t->released = true;
+    TexGpu* img = t->gpu;
+    if (!img) return;
+    t->gpu = nullptr;
+    pool_texture_remade(t);
+    destroy_texture_gpu(img);
+    if (--img->owners > 0) return;
+    // No live texture holds the image any more. A finalized one still drawn through it (a pool entry the game has not registered again)
+    // lets go too, or the image would stay for as long as that entry does: in fefw-recomp #174 sets of 8192 x 8192 shadow maps piled up
+    // until video memory ran out. Its entry then reads the dummy, or the image of the next live texture on the storage.
+    std::vector<Ref<Texture>> borrowers;
+    borrowers.swap(img->borrowers);
+    for (const Ref<Texture>& b : borrowers) {
+        if (b->gpu != img) continue;   // took another image meanwhile
+        b->gpu = nullptr;
+        pool_texture_remade(b.get());
+        destroy_texture_gpu(img);
+        const uint64_t n = g_borrows_ended.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 4 || (n & (n - 1)) == 0) NXLOG_I(kTag, "texture %u: borrowed image given back with its last owner's (%llu so far)", b->id,
+                                                  static_cast<unsigned long long>(n));
+    }
+}
+
 void tex_destroy(TexGpu* g) {
     if (!g) return;
     if (--g->refs > 0) return;   // another texture object over the same storage still uses the image
@@ -3652,6 +3693,9 @@ void tex_destroy(TexGpu* g) {
         if (!g_live_set.erase(g)) return;   // already destroyed by tex_shutdown
     }
     g_gauge_textures_live.sub(1);
+    for (const Ref<Texture>& b : g->borrowers)
+        if (b->gpu == g) b->gpu = nullptr;   // still listed only at shutdown
+    g->borrowers.clear();
     if (g->presented) device().wait_idle();
     if (g->img) g_live_images.fetch_sub(1);
     // The record is out of every table now; what is left are Vulkan objects the GPU is done with (tex_destroy runs from retire(), or at
