@@ -556,7 +556,13 @@ int sites_missing(const std::string& mod_dir) {
         if (!e.is_regular_file(ec) || _wcsicmp(e.path().extension().c_str(), L".sites") != 0) continue;
         SiteList want;
         if (!read_site_list(e.path(), &want) || want.bid.empty() || !same_build(want.bid, l.bid)) continue;
-        for (const auto& s : want.sites) missing += l.sites.count(s) == 0;
+        for (const auto& s : want.sites) {
+            // only the kinds a mod can add (Set up skips any other with a warning, fefw-recomp #165), or such a line would read as
+            // missing on every start
+            const std::string& k = s.first;
+            if (k != "inline" && k != "midhook" && k != "entryhook") continue;
+            missing += l.sites.count(s) == 0;
+        }
     }
     return missing;
 }
