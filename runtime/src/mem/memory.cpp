@@ -157,12 +157,12 @@ bool g_oom_hinted = false;          // the hint is ours to clear
 bool out_of_commit(DWORD e) { return e == ERROR_COMMITMENT_LIMIT || e == ERROR_NOT_ENOUGH_MEMORY || e == ERROR_COMMITMENT_MINIMUM; }
 void oom_failed_locked(DWORD e) {
     if (!out_of_commit(e)) return;
-    crash_set_hint(kOutOfMemoryHint);
+    crash_set_memory_hint(kOutOfMemoryHint);
     g_oom_hinted = true;
 }
 void oom_ok_locked() {               // a later commit worked: whatever ends the run now has another cause
     if (!g_oom_hinted) return;
-    crash_set_hint("");
+    crash_set_memory_hint("");
     g_oom_hinted = false;
 }
 
