@@ -117,7 +117,7 @@ def native_cpu():
     """The bundled Zig's name for this processor (`zig targets`: .native .cpu .name), or None."""
     try:
         out = subprocess.run([ZIG, 'targets'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
-                             creationflags=CREATE_NO_WINDOW, timeout=120).stdout.decode('utf-8', 'replace')
+                             timeout=120, **NO_WINDOW).stdout.decode('utf-8', 'replace')
     except (OSError, subprocess.SubprocessError):
         return None
     i = out.find('.native')
@@ -211,6 +211,8 @@ def cxxflags(variant):
         extra += ['-DNX_FAST_FMA']   # recomp fpexact.h / cxx.h / neon.h: fused multiply-adds as a multiply and an add (no FMA3 here)
     return ['-target', 'x86_64-windows-gnu', '-mcpu=' + mcpu(variant)] + common + extra
 CREATE_NO_WINDOW = 0x08000000
+# subprocess's creationflags exist on Windows only: elsewhere a non-zero value raises ValueError (fefw-recomp #172, metrist38)
+NO_WINDOW = {'creationflags': CREATE_NO_WINDOW} if WINDOWS else {}
 BELOW_NORMAL = 0x00004000
 
 
@@ -291,7 +293,7 @@ def host_features():
     fefw_rt.dll does. FEFW_CPU_FORCE_MISSING (a test hook, as for the launcher and fefw_rt.dll) hides features."""
     try:
         out = subprocess.run([ZIG, 'targets'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
-                             creationflags=CREATE_NO_WINDOW, timeout=120).stdout.decode('utf-8', 'replace')
+                             timeout=120, **NO_WINDOW).stdout.decode('utf-8', 'replace')
     except (OSError, subprocess.SubprocessError):
         return None
     i = out.find('.native')

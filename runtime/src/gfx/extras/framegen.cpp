@@ -642,17 +642,26 @@ void framegen_present_end() {
         if (!s.t0) {
             s.t0 = now;
             s.ffx_count0 = ffx_fg_present_count();
+        } else if (const uint64_t restarted = ffx_fg_present_count(); restarted < s.ffx_count0) {
+            // the swapchain was remade (Alt+Enter, a resize) and FFX's present count started again: a window across that would count
+            // the shown frames from the restart only, against all of its game frames, so start the window again from here
+            s.t0 = now;
+            s.ffx_count0 = restarted;
+            s.n_game = s.n_on = s.n_extra_inputs = 0;
         } else if (now - s.t0 >= 2000000000ull) {
             const double sec = static_cast<double>(now - s.t0) * 1e-9;
             const uint64_t c = ffx_fg_present_count();
+            // A swapchain remade since the window began (Alt+Enter, a resize) restarts FFX's present count: c - count0 would wrap
+            // around to an enormous number (fefw-recomp #171, metrist38). Count from the restart then.
+            const uint64_t shown = c >= s.ffx_count0 ? c - s.ffx_count0 : c;
             NXLOG_I(kTag, "FSR 3: %.1f game fps, %.1f shown fps (swapchain presents), generation on %u of %u frames%s", s.n_game / sec,
-                    static_cast<double>(c - s.ffx_count0) / sec, s.n_on, s.n_game,
+                    static_cast<double>(shown) / sec, s.n_on, s.n_game,
                     s.n_extra_inputs ? ", some frames had more than one DLSS evaluation" : "");
-            set_shown_ratio(s.n_game, static_cast<double>(c - s.ffx_count0), s.n_on);
-            s.win_shown = static_cast<uint32_t>(c - s.ffx_count0);
+            set_shown_ratio(s.n_game, static_cast<double>(shown), s.n_on);
+            s.win_shown = static_cast<uint32_t>(shown);
             s.win_game = s.n_game;
             s.win_game_fps = s.n_game / sec;
-            s.win_shown_fps = static_cast<double>(c - s.ffx_count0) / sec;
+            s.win_shown_fps = static_cast<double>(shown) / sec;
             s.win_measured = s.n_game > 0;
             publish_status(s);
             s.t0 = now;
