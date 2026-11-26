@@ -1007,7 +1007,7 @@ TexGpu* tex_or_null(Texture* t, float want_scale = 1.0f) {
             if (ag->uploaded || ag->gpu_written) t->cpu_dirty.store(false);
             static int logged = 0;
             if (logged++ < 20) NXLOG_I(kTag, "texture %u shares the image of texture %u (the same storage)%s", t->id, alias->id,
-                                       t->released ? ", borrowed by a finalized texture" : "");
+                                       borrow && t->released ? ", borrowed by a finalized texture" : "");
             return ag;
         }
     }
