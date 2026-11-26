@@ -180,6 +180,7 @@ struct Texture : Obj {
     std::atomic<uint32_t> prep_sched{0};    // 0x80000000 | prep_gen when a background job was requested for that generation
     std::atomic<uint32_t> prep_prov{0};     // 0x80000000 | prep_gen when the image holds a quick stand-in for that generation (texprep::provisional_uploaded)
     TexGpu* gpu = nullptr;                  // render thread only
+    bool released = false;                  // render thread only: the game finalized it and its release has run (tex_release)
     // Sparse textures kept as a Vulkan sparse-residency image (too big to back fully): the storage ranges [first, second) written or remapped
     // since the last upload, so only those 64 KiB tiles are uploaded again. sparse_all: everything (until the first upload).
     std::mutex sparse_mu;
