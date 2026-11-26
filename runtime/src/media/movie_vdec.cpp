@@ -21,8 +21,8 @@
 // Layouts (SDK 22.2): VideoFrame +0x08 buffer, +0x28 / +0x30 bytes of luma / chroma written, +0x48 buffer size, +0x78 time, +0x88 end of
 // stream (u8); nn::movie::Buffer +0x00 data, +0x10 bytes, +0x18 time, +0x20 flags (8: end of stream). The host state hangs off the guest
 // object's first word (where the library keeps its own), with a marker in the second.
-//   [media] movies = host | skip          host (default for a title with game::Info::movie_video_decoder); skip: every movie fails to open
-//                                         and the game moves on as after a skip (core/switch2.cpp)
+//   [media] movies = host | skip          host (default for a title with game::Info::movie_video_decoder); skip: each movie ends at its first
+//                                         packet, nothing decoded, and the game moves on as when a movie plays out (vd_decode_async)
 //   [media] video_decoder_threads = 0     dav1d worker threads per decoder; 0 (default): half the logical processors, 4 to 8
 //   [media] video_decoder_frame_delay = 0 dav1d max_frame_delay; 0 (default): ceil(sqrt(threads)) frames in flight for frame-level parallelism;
 //                                         1: single-frame low-latency mode (tile parallelism only)
@@ -790,6 +790,9 @@ void vd_decode_async(::Ctx* c) {   // (self, const nn::movie::Buffer*)
                 ++d->packets;
                 if (g_skipped_logged.fetch_add(1, std::memory_order_relaxed) < 16) NXLOG_I(kTag, "[media] movies = skip: a movie ended at its first packet");
             }
+            // Keep asking for input so the demuxer never waits on this track: once eos_queued is set, input_has_room says no, and a
+            // demuxer blocked on video would hold back the sound track too.
+            d->in_ready.signal();
             lk.unlock();
             d->cv.notify_all();
             RET(0);
