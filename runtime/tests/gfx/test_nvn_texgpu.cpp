@@ -1424,7 +1424,6 @@ void check_rewrite_settles(Device& dev, Tex& x, VkFormat image_format) {
 
 // The second content has an RGBA8 cache entry; the image was made as BC7.
 NXTEST(texprep_rewrite_keeps_image_format_cache_entry) {
-    if (!astctest::transcoder_or_skip()) return;
     config_set("gfx", "astc_gpu", "off");
     struct Restore { ~Restore() { config_set("gfx", "astc_gpu", "auto"); no_cache(); } } restore;
     Rig r;
@@ -1467,7 +1466,6 @@ NXTEST(texprep_rewrite_keeps_image_format_cache_entry) {
 // [gfx] astc_bc = bc1: the first content has alpha (BC7 image), the second is opaque (a job would choose BC1). The setting is read once per
 // process, so this skips unless nothing resolved it before (run it by name).
 NXTEST(texprep_rewrite_keeps_image_format_bc1) {
-    if (!astctest::transcoder_or_skip()) return;
     config_set("gfx", "astc_gpu", "off");
     config_set("gfx", "astc_bc", "bc1");
     struct Restore { ~Restore() { config_set("gfx", "astc_gpu", "auto"); config_set("gfx", "astc_bc", "auto"); } } restore;
@@ -1500,7 +1498,6 @@ NXTEST(texprep_rewrite_keeps_image_format_bc1) {
 // The residency restore (tex_promote) makes the image again, in the format the storage's content asks for then: not in the old one a finished
 // job made its data in, and jobs follow the new one. The first image is RGBA8 (the content's cache entry), the new one BC7.
 NXTEST(texprep_rewrite_keeps_image_format_remade) {
-    if (!astctest::transcoder_or_skip()) return;
     config_set("gfx", "astc_gpu", "off");
     struct Restore { ~Restore() { config_set("gfx", "astc_gpu", "auto"); no_cache(); } } restore;
     Rig r;
@@ -1557,7 +1554,6 @@ NXTEST(texprep_rewrite_keeps_image_format_remade) {
 // A BC5 image whose storage is rewritten with uncached ASTC content (#177): the image is remade in a format chosen from the new content
 // (here BC7) and uploaded with the new data instead of being cleared to zero.
 NXTEST(bc5_rewrite_with_uncached_content_remakes_image) {
-    if (!astctest::transcoder_or_skip()) return;
     config_set("gfx", "astc_gpu", "off");
     struct Restore { ~Restore() { config_set("gfx", "astc_gpu", "auto"); no_cache(); } } restore;
     Rig r;
@@ -1608,7 +1604,6 @@ NXTEST(bc5_rewrite_with_uncached_content_remakes_image) {
 // A BC1 image takes later content with alpha too, as BC1. That data must not become a cache entry: a BC1 entry says the content is opaque, and
 // a texture with the same content would be given a BC1 image without an alpha scan. Run by name (as the test above this one).
 NXTEST(texprep_bc1_image_caches_opaque_content_only) {
-    if (!astctest::transcoder_or_skip()) return;
     config_set("gfx", "astc_gpu", "off");
     config_set("gfx", "astc_bc", "bc1");
     struct Restore {
@@ -1647,7 +1642,6 @@ NXTEST(texprep_bc1_image_caches_opaque_content_only) {
 // [nvn] tex_prep_verify compares a job's result with a preparation of its own, also when no cache entry holds the result (here RGBA8 data for
 // an RGBA8 image). The setting is read once per process, so this skips unless nothing started the background preparation before (run it by name).
 NXTEST(texprep_verifies_uncached_result) {
-    if (!astctest::transcoder_or_skip()) return;
     config_set("gfx", "astc_gpu", "off");
     config_set("nvn", "tex_prep_verify", "true");
     struct Restore {
