@@ -915,6 +915,7 @@ def write_exefs_record(exefs, applied, left_out, unused):
 # next start, like any DLL mod. The list main was lifted with is written next to ObeliskChamber.exe (ObeliskChamber.sites,
 # write_lifted_sites), so the runtime can tell a mod whose sites are missing from this build.
 MOD_SITE_KINDS = ('inline', 'midhook', 'entryhook')
+WARNED_SITES = set()   # (file:line) of the sites of an unknown kind already reported (collect_mod_sites)
 
 
 def collect_mod_sites(game, build_id):
@@ -928,7 +929,7 @@ def collect_mod_sites(game, build_id):
             if not f.lower().endswith('.sites') or not os.path.isfile(os.path.join(ex, f)):
                 continue
             where = '%s/exefs/%s' % (name, f)
-            bid, recs = None, []
+            bid, recs, skipped = None, [], []
             text = open(os.path.join(ex, f), encoding='utf-8-sig', errors='replace').read()
             for ln, line in enumerate(text.splitlines(), 1):
                 t = line.split('#', 1)[0].split()
@@ -940,7 +941,10 @@ def collect_mod_sites(game, build_id):
                     bid = t[1]
                     continue
                 if t[0] not in MOD_SITE_KINDS:
-                    raise Fail('%s:%d: "%s" is not a site a mod can add (%s)' % (where, ln, t[0], ', '.join(MOD_SITE_KINDS)))
+                    # A kind another port defines, or a later one: skipped with a warning (below, once the build ID matches) rather
+                    # than stopping Set up, as the three ports agreed in fefw-recomp issue #165.
+                    skipped.append((ln, t[0]))
+                    continue
                 try:
                     if len(t) != 2:
                         raise ValueError
@@ -952,6 +956,12 @@ def collect_mod_sites(game, build_id):
                 raise Fail('%s has no @nsobid line (the build ID of the main its sites are for)' % where)
             if not bid_matches(bid, build_id):
                 continue                 # another version of the game
+            for ln, kind in skipped:     # stderr, once per run: --check prints one JSON line on stdout
+                key = (where, ln)
+                if key not in WARNED_SITES:
+                    WARNED_SITES.add(key)
+                    print('warning: %s:%d: "%s" is not a site a mod can add here (%s): skipped'
+                          % (where, ln, kind, ', '.join(MOD_SITE_KINDS)), file=sys.stderr, flush=True)
             for ln, kind, addr in recs:
                 if addr % 4 or not MODULES[0][2] <= addr < MODULES[1][2]:
                     raise Fail('%s:%d: 0x%x is not an instruction address in main (main is at 0x%x)' % (where, ln, addr, MODULES[0][2]))

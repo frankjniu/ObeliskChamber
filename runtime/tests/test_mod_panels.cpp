@@ -17,7 +17,7 @@ namespace modapi = nxrt::services::modapi;
 static_assert(offsetof(NxModApi, add_panel) == offsetof(NxModApi, free_mem) + sizeof(void*), "add_panel follows free_mem");
 static_assert(offsetof(NxModApi, open_list) == offsetof(NxModApi, add_panel), "open_list and add_panel share their member");
 static_assert(offsetof(NxModApi, panel_visible) == offsetof(NxModApi, add_panel) + sizeof(void*), "panel_visible follows add_panel");
-static_assert(sizeof(NxModApi) == offsetof(NxModApi, panel_visible) + sizeof(void*), "panel_visible is the last member");
+static_assert(offsetof(NxModApi, get_interface) == offsetof(NxModApi, panel_visible) + sizeof(void*), "get_interface follows panel_visible (version 6)");
 static_assert(offsetof(NxModUi, text) == 8 && offsetof(NxModUi, tooltip) == 8 + 13 * sizeof(void*) && sizeof(NxModUi) == 8 + 14 * sizeof(void*),
               "NxModUi as in EmblemWeave");
 static_assert(NXMOD_API_VERSION >= 5, "panels are version 5 here");

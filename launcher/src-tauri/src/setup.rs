@@ -238,7 +238,8 @@ fn mod_sites(p: &Paths) -> Result<Vec<ModSite>, String> {
                     continue;
                 }
                 if !MOD_SITE_KINDS.contains(&t[0]) {
-                    return Err(format!("{where_}:{ln}: \"{}\" is not a site a mod can add ({})", t[0], MOD_SITE_KINDS.join(", ")));
+                    // a kind another port defines, or a later one: skipped, as the release script does (fefw-recomp issue #165)
+                    continue;
                 }
                 let addr = (t.len() == 2)
                     .then(|| u64::from_str_radix(t[1].trim_start_matches("0x").trim_start_matches("0X"), 16).ok())
@@ -1230,7 +1231,9 @@ mod tests {
             assert!(e.contains(want), "{e}");
             assert_eq!(missing_sites_detail(&p), e);
         };
-        check("@nsobid DB93B0125F4850601D61C3EDDE012F8EB2ECFE77\npatch 0x7100000000\n", "Some_Mod/exefs/bad.sites:2: \"patch\" is not a site a mod can add");
+        // a kind a mod cannot add here (another port's, or a later one) is skipped, not an error (fefw-recomp issue #165)
+        fs::write(&bad, "@nsobid DB93B0125F4850601D61C3EDDE012F8EB2ECFE77\npatch 0x7100000000\ndynimm 0x7100000004\n").unwrap();
+        assert!(mod_sites(&p).is_ok());
         check("@nsobid DB93B0125F4850601D61C3EDDE012F8EB2ECFE77\nmidhook zz\n", "bad.sites:2: expected \"<kind> <guest address in hex>\"");
         check("midhook 0x71016f21f4\n", "Some_Mod/exefs/bad.sites has no @nsobid line");
         check("@nsobid DB93B0125F4850601D61C3EDDE012F8EB2ECFE77\nmidhook 0x71016f21f2\n", "is not an instruction address in main");
