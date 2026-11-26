@@ -334,6 +334,7 @@ bool tex_first_upload_deferrable(Texture* t);
 // memory (written by the CPU, never by the GPU) whose image no command has used yet: no image, or one still in the undefined layout
 // (every use transitions it first). Not a sparse texture of a virtual pool.
 bool tex_early_upload_ok(Texture* t);
+bool tex_promote_for_test(Texture* t, Frame& f);   // the residency restore's new image (tex_promote), without a demotion before it
 // The image holds a stand-in of the texture's current content and the texture is waiting for its upload (its job's result is there, or the
 // render thread will keep the stand-in): the swap may wait a frame (the pool upload budget). Render thread.
 bool tex_standin_swap_pending(Texture* t);
