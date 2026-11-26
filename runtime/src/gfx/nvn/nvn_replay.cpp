@@ -6476,6 +6476,7 @@ void note_frame_for_pacing() {
     if (last_present == clk::time_point{} || now - last_present > std::chrono::milliseconds(100)) last_stall = now;
     last_present = now;
     low = per < 16 ? low + 1 : 0;
+    nxrt::note_load_frame(per < 16, last_stall == now);   // the load breakdown: where a load starts and its last stall
     const bool want = low >= 3 && now - last_stall < std::chrono::milliseconds(1500);
     if (want != nxrt::frame_limiter_unpaced()) {
         nxrt::frame_limiter_set_unpaced(want);

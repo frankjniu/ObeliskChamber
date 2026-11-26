@@ -46,6 +46,7 @@ void svc_exit_process(::Ctx* c) {
         NXLOG_I("svc", "svcExitProcess caller chain: %s", chain.c_str());
     }
     NXLOG_I("runtime", "state at svcExitProcess:\n%s", summary().c_str());
+    load_log_flush();
     session_log("session at exit");
     log_flush();
     profile_flush();                                 // profile-guided builds: ExitProcess skips the profile runtime's atexit
