@@ -64,6 +64,7 @@ offers none or it cannot be made. In versions 4 and 5 it shares its member with 
 that member stays for mods built before version 6, but a new mod asks for the list screen by name:
 
 ```c
+#include <stddef.h>   /* offsetof */
 const NxModListApi* list = NULL;
 if (api->version >= 6 && api->size >= offsetof(NxModApi, get_interface) + sizeof(api->get_interface))
     list = (const NxModListApi*)api->get_interface(api, NXMOD_LIST_INTERFACE, 1);
@@ -83,7 +84,7 @@ Registration lives in `include/nxrt/mod_interfaces.h` and `src/services/mod_inte
 
 ```cpp
 nxrt::nxmod::InterfaceRegistry& r = nxrt::nxmod::interfaces();
-r.add("emblemweave.ui.panel", 1, &panel_table);          // a fixed table
+r.add("obeliskchamber.list", 1, &list_table);           // a fixed table
 r.add_resolver("nxp.nxmod", 1, resolve_native_api);     // a table that depends on the caller
 ```
 

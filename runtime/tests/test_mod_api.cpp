@@ -13,14 +13,6 @@
 #include "nxrt/services_api.h"
 #include "test_framework.h"
 
-#ifdef _WIN32
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-
-#include <filesystem>
-#endif
 
 NXTEST_GROUP(mod_api)
 
@@ -205,7 +197,8 @@ NXTEST(bridge_nxp_nxmod) {
     CHECK(nxrt::nxmod::get_interface(&api, nullptr, 0) == nullptr);
 
     // A table registered by the host is reachable through the same lookup.
-    CHECK(nxrt::nxmod::interfaces().add("obeliskchamber.probe", 2, &g_table_v2));
+    static const bool added = nxrt::nxmod::interfaces().add("obeliskchamber.probe", 2, &g_table_v2);   // once per process
+    CHECK(added);
     CHECK(nxrt::nxmod::get_interface(&api, "obeliskchamber.probe", 0) == &g_table_v2);
     CHECK(nxrt::nxmod::get_interface(&api, "obeliskchamber.probe", 3) == nullptr);
 }
