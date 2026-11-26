@@ -12,18 +12,21 @@ The package ships no game code. This script
   1. verifies the dump's ExeFS against dump_hashes.json (the supported build: sha256 of every module + main's build ID) and writes
      <game>/exefs: the same NSOs with main uncompressed (the console's main is ZBIC-compressed; tools/build/nso_unpack.py),
   2. lifts the six NSOs with the bundled lifter (recomp/nxrecomp) into <game>/build/lift,
-  3. compiles the generated C++ with the bundled Zig (zig c++, mingw target) into <game>/build/obj, in parallel,
+  3. compiles the generated C++ with the bundled Zig (zig c++, mingw target) into <game>/build/objcache, in parallel; an object
+     an earlier build made from the same inputs is reused (fefw-recomp #208, metrist38),
   4. links ObeliskChamber.exe = sdk/fefw_stub.cpp + the lifted objects + sdk/fefw_rt.lib (the runtime, fefw_rt.dll in the package),
-  5. deletes the generated sources and objects (unless --keep) and records the result in <game>/build/done.json.
+  5. deletes the generated sources and other build files, keeping the lifted code's objects (all of build/ with --keep), and
+     records the result in <game>/build/done.json.
 
 The build stamp (state.json, done.json) is the dump (main build ID, module hashes) plus tool_stamp(): everything in this
 package that goes into ObeliskChamber.exe (lifter sources, main.sites, compile flags and processor variant, the SDK files with fefw_rt.lib). A release that
-changes any of them makes an older stamp stale: Set up then lifts, compiles and links again from scratch (the old ObeliskChamber.exe
-stays until the new one is linked over it). --check compares <game>/build/done.json with this package's tools only (no
+changes any of them makes an older stamp stale: Set up then lifts and links again (the old ObeliskChamber.exe stays until the new
+one is linked over it) and compiles the units whose inputs changed (object_key: the unit's source, the headers, the flags, Zig's
+version). Deleting <game>/build/objcache makes the next build compile everything. --check compares <game>/build/done.json with this package's tools only (no
 dump check, well under a second) and prints one JSON line {"current": bool, "reason": text}; exit 0 current, 3 not.
 
-Resumable: a module's lift counts once its marker file is written, an object once it is renamed into place, so a stopped
-build continues where it stopped. A file named <game>/build/cancel stops it (the launcher's Pause).
+Resumable: a module's lift counts once its marker file is written, an object once it is renamed into place (its name carries
+its own hash, so one damaged since is compiled again), so a stopped build continues where it stopped. A file named <game>/build/cancel stops it (the launcher's Pause).
 Output for the launcher, one per line on stdout:  @progress <phase> <done> <total> <text>  /  @error <text>
 Exit codes: 0 done, 1 error, 2 cancelled.
 """
@@ -1218,7 +1221,59 @@ def pgo_gen_skip(src):
         return False
 
 
-def compile_all(runner, gen, obj, jobs, env, variant):
+# The objects of the lifted code are kept in <game>/build/objcache/<module> from one build to the next, as
+# <unit>.<object_key>.<hash of the object>.o: most releases that make Set up build again change few of the generated files, or none.
+def compile_inputs(runner, env, variant):
+    """What every object depends on besides its module's generated files: Zig, the flags and the shared headers."""
+    rc, version = runner.run([ZIG, 'version'], env=env)
+    if rc != 0:
+        raise Fail('The bundled compiler does not run (exit %d):\n%s' % (rc, version))
+    return [version, cxxflags(variant), tree_hash(RECOMP, ['include'])]
+
+
+def object_key(shared, headers, src):
+    """The name part that says what an object was built from: shared (compile_inputs), the module's generated headers (every
+    file the lifter wrote there that is not a unit; module_headers) and the unit's source."""
+    return hashlib.sha256(json.dumps([shared, headers, sha256(src)]).encode()).hexdigest()[:16]
+
+
+def module_headers(d):
+    return [(f, sha256(os.path.join(d, f))) for f in sorted(os.listdir(d)) if not f.endswith('.cpp') and f != '.lifted']
+
+
+def cached_objects(d):
+    """{(unit, key): path} of the objects in d that are still what was written (a power loss can leave a renamed file short or
+    zeroed); the rest, and the half-written files of a stopped build, are removed."""
+    found = {}
+    for f in os.listdir(d):
+        path = os.path.join(d, f)
+        parts = f.split('.')
+        try:
+            if len(parts) == 4 and parts[3] == 'o' and sha256(path)[:12] == parts[2]:
+                found[parts[0], parts[1]] = path
+            else:
+                os.remove(path)
+        except OSError:                  # held open (an antivirus): not used this time
+            pass
+    return found
+
+
+def prune_objects(cache, objects):
+    """After a successful link: remove the objects this build did not use."""
+    keep = {os.path.normcase(p) for paths in objects.values() for p in paths}
+    for name, _, _, _, _ in MODULES:
+        d = os.path.join(cache, name)
+        for f in os.listdir(d):
+            path = os.path.join(d, f)
+            if os.path.normcase(path) not in keep:
+                try:
+                    os.remove(path)
+                except OSError:          # held open (an antivirus): the next build removes it
+                    pass
+
+
+def compile_all(runner, gen, cache, jobs, env, variant):
+    """Compile every unit that has no object in the cache yet -> {module: [object paths]} for link."""
     units = []
     for name, _, _, _, shards in MODULES:
         d = os.path.join(gen, name)
@@ -1226,21 +1281,32 @@ def compile_all(runner, gen, obj, jobs, env, variant):
             if f.endswith('.cpp'):
                 units.append((name, os.path.join(d, f)))
     total = len(units)
+    shared = compile_inputs(runner, env, variant)
+    headers, cached = {}, {}
+    for name, _, _, _, _ in MODULES:
+        d = os.path.join(cache, name)
+        os.makedirs(d, exist_ok=True)
+        cached[name] = cached_objects(d)
+        headers[name] = module_headers(os.path.join(gen, name))
+    objects = {name: [] for name, _, _, _, _ in MODULES}
     todo = []
     for name, src in units:
-        o = os.path.join(obj, name, os.path.basename(src)[:-4] + '.o')
-        if not os.path.isfile(o):
-            todo.append((name, src, o))
+        unit = os.path.basename(src)[:-4]
+        key = object_key(shared, headers[name], src)
+        if (unit, key) in cached[name]:
+            objects[name].append(cached[name][unit, key])
+        else:
+            todo.append((name, src, os.path.join(cache, name, '%s.%s' % (unit, key))))
     done = total - len(todo)
+    if done:
+        print('%d of %d units are unchanged since an earlier build: their objects are reused' % (done, total), flush=True)
     progress('compile', done, total, 'Compiling: %d of %d' % (done, total))
-    for name, _, _, _, _ in MODULES:
-        os.makedirs(os.path.join(obj, name), exist_ok=True)
     # biggest first, so the long ones do not end up last on a single core
     todo.sort(key=lambda t: -os.path.getsize(t[1]))
 
     def one(t):
-        name, src, o = t
-        tmp = o + '.tmp'
+        name, src, stem = t
+        tmp = stem + '.o.tmp'
         cmd = [ZIG, 'c++'] + cxxflags(variant) + ['-I', os.path.join(RECOMP, 'include'), '-I', os.path.dirname(src), '-c', src, '-o', tmp]
         if PGO['gen'] and pgo_gen_skip(src):     # see pgo_gen_skip
             cmd = [x for x in cmd if x not in ('-fprofile-generate',)]
@@ -1248,7 +1314,9 @@ def compile_all(runner, gen, obj, jobs, env, variant):
         if rc != 0:
             return 'Compiling %s/%s failed (exit %d):\n%s' % (name, os.path.basename(src), rc, tail)
         try:
+            o = '%s.%s.o' % (stem, sha256(tmp)[:12])
             replace_retry(tmp, o)
+            objects[name].append(o)
         except OSError as e:     # a failed unit, retried one at a time below, not an abort of the whole build
             return 'Compiling %s/%s: %s' % (name, os.path.basename(src), e)
         return None
@@ -1296,6 +1364,7 @@ def compile_all(runner, gen, obj, jobs, env, variant):
             raise Fail(err)
         done += 1
         progress('compile', done, total, 'Compiling: %d of %d' % (done, total))
+    return objects
 
 
 def replace_retry(src, dst):
@@ -1328,14 +1397,16 @@ def clear_high_entropy_va(exe):
         f.write(dc.to_bytes(2, 'little'))
 
 
-def link(runner, obj, game, env, variant):
+def link(runner, objects, obj, game, env, variant):
+    """ObeliskChamber.exe from the lifted code's objects (compile_all) and the SDK; the archives and other objects go to obj."""
     progress('link', 0, 1, 'Linking ObeliskChamber.exe')
+    os.makedirs(obj, exist_ok=True)
     libs = []
     for name, _, _, _, _ in MODULES:
         a = os.path.join(obj, 'fefw_%s.a' % name)
         if os.path.isfile(a):
             os.remove(a)
-        objs = sorted(os.path.join(obj, name, f) for f in os.listdir(os.path.join(obj, name)) if f.endswith('.o'))
+        objs = sorted(objects[name])
         rsp = os.path.join(obj, '%s.rsp' % name)
         # UTF-8, not the ANSI code page: zig ar reads the response file as UTF-8, so a game folder path with non-ASCII
         # characters (an accented user name) failed the archive step.
@@ -1391,7 +1462,7 @@ def main():
     ap.add_argument('--exefs')
     ap.add_argument('--game')
     ap.add_argument('--jobs', type=int, default=max(1, (os.cpu_count() or 2) - 1))
-    ap.add_argument('--keep', action='store_true', help='keep the generated sources and objects')
+    ap.add_argument('--keep', action='store_true', help='keep the generated sources and all build files')
     ap.add_argument('--check', action='store_true', help='only say whether <game>/build/done.json matches these tools')
     ap.add_argument('--cpu', default='auto', help='the build for the processor: fma, compat or auto (CPU_VARIANTS)')
     ap.add_argument('--pgo-gen', help='developer: build instrumented for a profile, linking this profile runtime library (.a)')
@@ -1476,10 +1547,13 @@ def main():
         lift(runner, plain, gen, a.jobs, sites)
         times['lift'] = round(time.time() - t, 1)
         t = time.time()
-        compile_all(runner, gen, obj, a.jobs, env, variant)
+        # a profile-guided build's objects are not kept: the key does not cover the profile's contents
+        cache = os.path.join(obj if PGO['gen'] or PGO['use'] else build, 'objcache')
+        objects = compile_all(runner, gen, cache, a.jobs, env, variant)
         times['compile'] = round(time.time() - t, 1)
         t = time.time()
-        exe = link(runner, obj, game, env, variant)
+        exe = link(runner, objects, obj, game, env, variant)
+        prune_objects(cache, objects)
         live = os.path.join(game, 'exefs')
         os.makedirs(live, exist_ok=True)
         for n in EXEFS_FILES:
