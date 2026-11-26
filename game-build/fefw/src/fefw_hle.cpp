@@ -68,9 +68,10 @@ extern "C" void nx_hle_zstd_multiframe(Ctx* c, void (*orig)(Ctx*)) {
 // empty and inverted boxes, every plane count and flag among them), no answer differing, in each of the three ways the game code is
 // built (FMA3; without it with NX_FAST_FMA; without it with the exact library fmaf).
 //
-// FEFW_HLE_CULL (environment): unset or 0 = the lifted originals (default), 1 = the native tests, 2 = both, compared: the lifted
+// FEFW_HLE_CULL (environment): unset or 1 = the native tests (default), 0 = the lifted originals, 2 = both, compared: the lifted
 // answer is the one returned, and cull_verify.log beside the program gets the first 16 calls that differ and a count line at the
-// first call and at each power of four after it.
+// first call and at each power of four after it. On by default since fefw-recomp turned on this code of ours (their #217, metrist38),
+// whose test also looks for the value at which each answer changes (recomp/tests/hle_cull_test.cpp).
 #pragma clang fp contract(off)
 
 namespace {
@@ -209,7 +210,7 @@ int cull_mode() {
     int v = __atomic_load_n(&mode, __ATOMIC_RELAXED);
     if (v < 0) {
         const char* e = getenv("FEFW_HLE_CULL");
-        v = e && e[0] >= '1' && e[0] <= '2' && !e[1] ? e[0] - '0' : 0;
+        v = e && e[0] >= '0' && e[0] <= '2' && !e[1] ? e[0] - '0' : 1;
         __atomic_store_n(&mode, v, __ATOMIC_RELAXED);
     }
     return v;
