@@ -19,6 +19,20 @@
 #include <thread>
 #include <vector>
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+#endif
+
+#include "nxrt/config.h"
 #include "nxrt/gauge.h"
 #include "nxrt/log.h"
 #include "nxrt/services_api.h"
@@ -159,14 +173,81 @@ ViState& vi() {
 }
 
 // The display's vsync: a host thread signals the event at 60 Hz. Started by the first GetDisplayVsyncEvent, stopped by vi_nv_reset().
+// [vi] vsync_deadlines (default on): each tick waits for its own deadline, start + n x 16,666,667 ns, on a high-resolution waitable timer
+// (Windows) or sleep_until, so a late wake-up does not move the ticks after it. A tick later than a whole period skips the ticks it missed
+// rather than signalling them in a burst. off: a relative 16,667 us wait each time, as before; every wake-up's lateness (the condition
+// variable's, at Windows' timer resolution) added up, so the event ran below 60 Hz (Red Tunic's ticker moved to a waitable timer for this).
+// A log line every 60 s: ticks, the rate they came at, late and skipped ones.
+#ifdef _WIN32
+void vsync_wait_until(std::chrono::steady_clock::time_point t, HANDLE timer) {
+    const auto now = std::chrono::steady_clock::now();
+    if (t <= now) return;
+    const int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t - now).count();
+    LARGE_INTEGER due;
+    due.QuadPart = -((ns + 99) / 100);
+    if (timer && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) WaitForSingleObject(timer, INFINITE);
+    else std::this_thread::sleep_until(t);
+}
+#endif
+
 void vsync_main() {
     ViState& s = vi();
-    std::unique_lock<std::mutex> lk(s.mu);
-    while (!s.vsync_stop) {
-        s.cv.wait_for(lk, std::chrono::microseconds(16667), [&] { return s.vsync_stop; });
-        if (s.vsync_stop) break;
-        s.vsync.signal();
+    static const bool deadlines = nxrt::config_get_bool("vi", "vsync_deadlines", true);
+    if (!deadlines) {
+        std::unique_lock<std::mutex> lk(s.mu);
+        while (!s.vsync_stop) {
+            s.cv.wait_for(lk, std::chrono::microseconds(16667), [&] { return s.vsync_stop; });
+            if (s.vsync_stop) break;
+            s.vsync.signal();
+        }
+        return;
     }
+    using clk = std::chrono::steady_clock;
+    constexpr std::chrono::nanoseconds kPeriod(16666667);
+#ifdef _WIN32
+    HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    if (!timer) timer = CreateWaitableTimerW(nullptr, TRUE, nullptr);
+#endif
+    const clk::time_point start = clk::now();
+    clk::time_point log_at = start + std::chrono::seconds(60);
+    uint64_t n = 0, ticks = 0, late = 0, skipped = 0, win_ticks = 0;
+    clk::time_point win_start = start;
+    for (;;) {
+        ++n;
+        const clk::time_point due = start + n * kPeriod;
+#ifdef _WIN32
+        vsync_wait_until(due, timer);
+#else
+        std::this_thread::sleep_until(due);
+#endif
+        const clk::time_point now = clk::now();
+        {
+            std::lock_guard<std::mutex> lk(s.mu);
+            if (s.vsync_stop) break;
+            s.vsync.signal();
+        }
+        ++ticks;
+        ++win_ticks;
+        if (now - due > std::chrono::milliseconds(2)) ++late;
+        if (now - due >= kPeriod) {                     // a stall: the missed ticks are skipped, not signalled at once
+            const uint64_t behind = static_cast<uint64_t>((now - due) / kPeriod);
+            n += behind;
+            skipped += behind;
+        }
+        if (now >= log_at) {
+            const double secs = std::chrono::duration<double>(now - win_start).count();
+            NXLOG_I(kTagVi, "display vsync: %llu ticks in %.1f s (%.2f Hz); %llu more than 2 ms late, %llu skipped after a stall, since the start ([vi] vsync_deadlines)",
+                    static_cast<unsigned long long>(win_ticks), secs, secs > 0 ? static_cast<double>(win_ticks) / secs : 0.0, static_cast<unsigned long long>(late),
+                    static_cast<unsigned long long>(skipped));
+            win_ticks = 0;
+            win_start = now;
+            log_at = now + std::chrono::seconds(60);
+        }
+    }
+#ifdef _WIN32
+    if (timer) CloseHandle(timer);
+#endif
+    (void)ticks;
 }
 
 void vsync_stop_and_join() {

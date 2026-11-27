@@ -30,6 +30,7 @@
 #include "nxrt/platform.h"
 #include "nxrt/runtime.h"
 #include "extras/framegen.h"
+#include "present_log.h"
 #include "extras/framegen_ffx.h"
 #include "extras/hdr_capture.h"
 #include "extras/hdr_math.h"
@@ -358,6 +359,7 @@ struct Renderer::Impl {
     VkColorSpaceKHR color_space = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     uint32_t format_serial = 0;
     std::unique_ptr<extras::LowLatency> latency;
+    std::unique_ptr<PresentLog> plog;   // [gfx] present_log (present_log.h); null when off
     VkExtent2D extent = {0, 0};
     uint32_t headless_w = 0, headless_h = 0;
     struct Target {
@@ -699,6 +701,10 @@ struct Renderer::Impl {
             ci.pNext = &fse;
         }
 #endif
+        // before vkCreateSwapchainKHR, which retires `old`: vkWaitForPresentKHR must not wait on a retired swapchain
+        // (VUID-vkWaitForPresentKHR-swapchain-04997), so the present-wait thread lets go of it first. Not under the queue lock: it may
+        // wait for that thread (up to one 10 ms wait).
+        if (old && plog) plog->swapchain_going(old);
         extras::framegen_swapchain_reset();
         VkSwapchainKHR fresh = VK_NULL_HANDLE;
         VkResult r = vkCreateSwapchainKHR(vk(), &ci, nullptr, &fresh);
@@ -841,6 +847,7 @@ struct Renderer::Impl {
         slots.clear();
         destroy_targets();
         extras::framegen_swapchain_reset();
+        if (swapchain && plog) plog->swapchain_going(swapchain);
         if (swapchain) {
             std::lock_guard<std::mutex> ql(dev->queue_mutex());
             if (latency) latency->swapchain_destroyed(swapchain);
@@ -869,6 +876,7 @@ std::unique_ptr<Renderer> Renderer::create(Device& dev, const RendererDesc& desc
     s.decide_output();
     s.latency = std::make_unique<extras::LowLatency>(dev);
     extras::lowlat_set(s.latency.get());
+    if (!s.headless) s.plog = PresentLog::create(dev);
     if (!s.create_slots()) {
         if (error) *error = "could not create the frame slots";
         return nullptr;
@@ -1127,6 +1135,7 @@ void Renderer::end_frame(SubmitPrefix* prefix) {
             pi.pSwapchains = &s.swapchain;
             pi.pImageIndices = &s.cur_image;
             VkPresentIdKHR pid = {VK_STRUCTURE_TYPE_PRESENT_ID_KHR};
+            if (s.plog) present_id = s.plog->id_for_present(present_id);   // [gfx] present_log: an id on every present (Reflex's when it has one)
             if (present_id) {
                 pid.swapchainCount = 1;
                 pid.pPresentIds = &present_id;
@@ -1134,6 +1143,7 @@ void Renderer::end_frame(SubmitPrefix* prefix) {
             }
             r = vkQueuePresentKHR(s.dev->queue(), &pi);
             s.st.presents++;
+            if (s.plog && (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR)) s.plog->presented(s.swapchain, present_id);
             if (r != VK_SUCCESS) diag_vk_note(static_cast<int>(r), "vkQueuePresentKHR", __FILE__, __LINE__);
             if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR || r == VK_ERROR_SURFACE_LOST_KHR) {
                 s.dirty = true;

@@ -800,6 +800,7 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
     VkPhysicalDeviceTransformFeedbackFeaturesEXT atfb = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT};
     VkPhysicalDeviceIndexTypeUint8FeaturesEXT au8 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_EXT};
     VkPhysicalDevicePresentIdFeaturesKHR apid = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR};
+    VkPhysicalDevicePresentWaitFeaturesKHR apw = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR};
     VkPhysicalDeviceAntiLagFeaturesAMD aal = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ANTI_LAG_FEATURES_AMD};
     VkPhysicalDevicePipelineRobustnessFeaturesEXT aprb = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT};
     VkPhysicalDeviceFragmentShadingRateFeaturesKHR afsr = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR};
@@ -853,6 +854,10 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
     if (x_hdrmd) dev_exts.push_back(VK_EXT_HDR_METADATA_EXTENSION_NAME);
     const bool x_pid = !headless && add_ext(VK_KHR_PRESENT_ID_EXTENSION_NAME, &apid);
     const bool x_ll2 = x_pid && has_dext(VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
+    // [gfx] present_log (present_log.h): enabled only when the log will use it, so present_log = false (and frame generation, whose
+    // swapchain the log leaves alone) keep the device exactly as before the log existed
+    const bool want_pw = config_get_bool("gfx", "present_log", true) && !extras::framegen_requested();
+    const bool x_pw = x_pid && want_pw && add_ext(VK_KHR_PRESENT_WAIT_EXTENSION_NAME, &apw);
     if (x_ll2) dev_exts.push_back(VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
     const bool x_aal = !headless && add_ext(VK_AMD_ANTI_LAG_EXTENSION_NAME, &aal);
     // the OS's video memory budget and this process' usage per heap, which vmaGetHeapBudgets (the vma.device_* gauges, the memory guard)
@@ -976,6 +981,7 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
     }
     features_.hdr_metadata = x_hdrmd;
     features_.present_id = x_pid && apid.presentId;
+    features_.present_wait = x_pw && apw.presentWait && features_.present_id;
     features_.low_latency2 = x_ll2 && features_.present_id;
     features_.anti_lag = x_aal && aal.antiLag;
     features_.fragment_shading_rate = x_fsr && afsr.pipelineFragmentShadingRate;
