@@ -67,14 +67,14 @@ def declared_with(clang, defs):
 
     def in_headers():
         p = cur['file']
-        return p is not None and os.path.abspath(os.path.join(ROOT, p) if not os.path.isabs(p) else p).startswith(HDR_DIR)
+        return p is not None and os.path.abspath(os.path.join(ROOT, p) if not os.path.isabs(p) else p).startswith(HDR_DIR + os.sep)
 
-    def walk(n, c_linkage):
+    def walk(n, c_linkage, braces=False):
         note_file(n)
         kind = n.get('kind')
         if kind == 'LinkageSpecDecl':
             for ch in n.get('inner', []):
-                walk(ch, n.get('language') == 'C')
+                walk(ch, n.get('language') == 'C', n.get('hasBraces', False))
             return
         if kind == 'FunctionDecl' and in_headers():
             has_body = any(ch.get('kind') == 'CompoundStmt' for ch in n.get('inner', []))
@@ -83,7 +83,9 @@ def declared_with(clang, defs):
                 found[n['name']] = 'function'
         elif kind == 'VarDecl' and in_headers():
             # `extern "C" T x;` (no braces) is a declaration too: clang gives it no storage class, and no initialiser
-            if c_linkage and n.get('storageClass') in ('extern', None) and 'init' not in n and not n.get('isImplicit'):
+            # (inside `extern "C" { ... }` a variable without `extern` is a definition, not a declaration)
+            if c_linkage and (n.get('storageClass') == 'extern' or (n.get('storageClass') is None and not braces)) and 'init' not in n \
+                    and not n.get('isImplicit'):
                 found[n['name']] = 'data'
         for ch in n.get('inner', []) if kind in ('TranslationUnitDecl', 'NamespaceDecl') else []:
             walk(ch, c_linkage)
