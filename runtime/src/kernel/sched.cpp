@@ -283,17 +283,22 @@ void sched_set_process_qos() {
     st.ControlMask |= PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
 #endif
     st.StateMask = 0;   // controlled and off: never throttled
-    if (SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &st, sizeof st))
+    bool ok = SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &st, sizeof st) != 0;
+    if (!ok && st.ControlMask != PROCESS_POWER_THROTTLING_EXECUTION_SPEED) {   // Windows 10 refuses the timer resolution bit (Windows 11)
+        st.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+        ok = SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &st, sizeof st) != 0;
+    }
+    if (ok)
         NXLOG_I("sched", "[sched] high_qos: power throttling off for the process (game and render threads at full speed)");
     else
         NXLOG_W("sched", "[sched] high_qos: SetProcessInformation(ProcessPowerThrottling) failed, error %lu", static_cast<unsigned long>(GetLastError()));
 }
 
-void sched_background_memory(bool background) {
+void sched_background_memory(bool background, void* thread) {
     if (!high_qos()) return;
     MEMORY_PRIORITY_INFORMATION mp = {};
     mp.MemoryPriority = background ? MEMORY_PRIORITY_LOW : MEMORY_PRIORITY_NORMAL;
-    SetThreadInformation(GetCurrentThread(), ThreadMemoryPriority, &mp, sizeof mp);
+    SetThreadInformation(thread ? static_cast<HANDLE>(thread) : GetCurrentThread(), ThreadMemoryPriority, &mp, sizeof mp);
 }
 
 void sched_set_process_priority(bool interactive) {

@@ -366,6 +366,7 @@ void boost_thread(void* handle) {
     st.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
     st.StateMask = 0;                                    // explicitly not throttled
     SetThreadInformation(h, ThreadPowerThrottling, &st, sizeof st);
+    nxrt::kernel::sched_background_memory(false, h);     // [sched] high_qos: a draw waits on it, normal memory priority
 }
 void* self_handle() { return t_self.get(); }
 #else

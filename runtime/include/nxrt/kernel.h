@@ -186,7 +186,7 @@ void sched_set_process_priority(bool interactive);
 void sched_set_process_qos();
 // [sched] high_qos: a background worker's memory priority. `background` = low (Windows takes its pages off the standby list first under
 // memory pressure), false = normal again. Nothing without the switch.
-void sched_background_memory(bool background);
+void sched_background_memory(bool background, void* thread = nullptr);   // thread: a HANDLE (null: the calling thread)
 void sched_apply(KThread& t);            // (re)applies affinity + priority of t to its host thread
 std::string sync_wait_report();          // the guest threads blocked in WaitForAddress / process-wide keys / mutex hand-overs, with the word each waits on (watchdog dump; never blocks)
 void yield_host();                       // the calling thread offers its processor to another ready thread (SwitchToThread), unless the starvation guard aged it
