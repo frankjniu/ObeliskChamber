@@ -675,20 +675,28 @@ NXTEST(heap_protect_cycle_is_fast_with_full_heap) {
     mem::shutdown();
 }
 
-// [memory] unmapped_access borrows a page in another allocation's reservation by committing it read-only (unmapped.cpp,
-// borrow_page). That is only safe if the owner's later commit of the same page with its own protection takes effect, as the NT heap
-// does when it grows into its reserved tail: check the OS does that, and that the page is still all zero for the owner.
-NXTEST(a_read_only_commit_is_taken_over_by_the_owners_read_write_commit) {
-    uint8_t* base = static_cast<uint8_t*>(VirtualAlloc(nullptr, 0x10000, MEM_RESERVE, PAGE_READWRITE));
-    CHECK(base != nullptr);
-    uint8_t* page = base + 0x3000;
-    CHECK(VirtualAlloc(page, 0x1000, MEM_COMMIT, PAGE_READONLY) == page);
-    CHECK(page[0] == 0 && page[0xfff] == 0);
-    CHECK(VirtualAlloc(base, 0x8000, MEM_COMMIT, PAGE_READWRITE) == base);   // the owner commits a range that covers it
-    MEMORY_BASIC_INFORMATION mbi{};
-    CHECK(VirtualQuery(page, &mbi, sizeof mbi) != 0);
-    CHECK(mbi.State == MEM_COMMIT && mbi.Protect == PAGE_READWRITE);
-    page[0x10] = 0x5a;   // writable for the owner now
-    CHECK(page[0x10] == 0x5a && page[0x11] == 0);
-    VirtualFree(base, 0, MEM_RELEASE);
+
+// [memory] unmapped_access points a lifted read of the null page area (or of a host reservation) at a zero block for one instruction:
+// the decoder must find the operand's base register, and refuse what it can't redirect.
+NXTEST(unmapped_reads_find_the_base_register_of_the_faulting_load) {
+    struct Case { std::vector<uint8_t> code; int base; };
+    const Case cases[] = {
+        {{0x48, 0x8b, 0x41, 0x08}, 1},                 // mov rax, [rcx+8]
+        {{0x41, 0x0f, 0xb6, 0x01}, 9},                 // movzx eax, byte [r9]
+        {{0xc5, 0xf8, 0x10, 0x42, 0x10}, 2},           // vmovups xmm0, [rdx+0x10]
+        {{0xc4, 0xc1, 0x7e, 0x6f, 0x00}, 8},           // vmovdqu ymm0, [r8]
+        {{0x48, 0x8b, 0x04, 0xc8}, 0},                 // mov rax, [rax+rcx*8]
+        {{0x41, 0x80, 0x7d, 0x00, 0x00}, 13},          // cmp byte [r13+0], 0
+        {{0x66, 0x0f, 0x6f, 0x46, 0x20}, 6},           // movdqa xmm0, [rsi+0x20]
+        {{0x48, 0x8b, 0x05, 0, 0, 0, 0}, -1},          // mov rax, [rip+0]: refused
+        {{0x48, 0x8b, 0x04, 0x25, 8, 0, 0, 0}, -1},    // mov rax, [8] (no base): refused
+        {{0x48, 0x8b, 0x04, 0x00}, -1},                // mov rax, [rax+rax]: refused
+        {{0x65, 0x48, 0x8b, 0x00}, -1},                // mov rax, gs:[rax]: refused
+        {{0x48, 0x89, 0xc8}, -1},                      // mov rax, rcx (no memory operand): refused
+    };
+    for (const Case& t : cases) {
+        std::vector<uint8_t> code = t.code;
+        code.resize(16, 0x90);
+        CHECK(mem::unmapped_base_register_for_test(code.data()) == t.base);
+    }
 }
