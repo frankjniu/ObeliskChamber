@@ -674,3 +674,21 @@ NXTEST(heap_protect_cycle_is_fast_with_full_heap) {
     CHECK_MSG(ms < 2000, "50 protect cycles on a 256 MiB committed heap took " + std::to_string(ms) + " ms");
     mem::shutdown();
 }
+
+// [memory] unmapped_access borrows a page in another allocation's reservation by committing it read-only (unmapped.cpp,
+// borrow_page). That is only safe if the owner's later commit of the same page with its own protection takes effect, as the NT heap
+// does when it grows into its reserved tail: check the OS does that, and that the page is still all zero for the owner.
+NXTEST(a_read_only_commit_is_taken_over_by_the_owners_read_write_commit) {
+    uint8_t* base = static_cast<uint8_t*>(VirtualAlloc(nullptr, 0x10000, MEM_RESERVE, PAGE_READWRITE));
+    CHECK(base != nullptr);
+    uint8_t* page = base + 0x3000;
+    CHECK(VirtualAlloc(page, 0x1000, MEM_COMMIT, PAGE_READONLY) == page);
+    CHECK(page[0] == 0 && page[0xfff] == 0);
+    CHECK(VirtualAlloc(base, 0x8000, MEM_COMMIT, PAGE_READWRITE) == base);   // the owner commits a range that covers it
+    MEMORY_BASIC_INFORMATION mbi{};
+    CHECK(VirtualQuery(page, &mbi, sizeof mbi) != 0);
+    CHECK(mbi.State == MEM_COMMIT && mbi.Protect == PAGE_READWRITE);
+    page[0x10] = 0x5a;   // writable for the owner now
+    CHECK(page[0x10] == 0x5a && page[0x11] == 0);
+    VirtualFree(base, 0, MEM_RELEASE);
+}
