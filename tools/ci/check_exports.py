@@ -61,10 +61,9 @@ def declared_with(clang, defs, flags):
     cur = {'file': None}
 
     def note_file(n):
-        for key in ('loc', 'range'):
-            loc = n.get(key) or {}
-            if key == 'range':
-                loc = loc.get('begin') or {}
+        # clang's JSON leaves out `file` when it equals the last one it printed, in the order loc, range.begin, range.end
+        rng = n.get('range') or {}
+        for loc in (n.get('loc') or {}, rng.get('begin') or {}, rng.get('end') or {}):
             for l in (loc, loc.get('spellingLoc') or {}, loc.get('expansionLoc') or {}):
                 if 'file' in l:
                     cur['file'] = l['file']
@@ -114,12 +113,16 @@ def def_exports():
         line = line.split(';', 1)[0].strip()
         if not line:
             continue
-        if line.upper() == 'EXPORTS':
+        word = line.split()[0].upper()
+        if word == 'EXPORTS':
             in_exports = True
+            continue
+        if word in ('LIBRARY', 'NAME', 'SECTIONS', 'STACKSIZE', 'HEAPSIZE', 'VERSION', 'DESCRIPTION'):
+            in_exports = False
             continue
         if in_exports:
             parts = line.split()
-            names[parts[0]] = 'data' if 'DATA' in (p.upper() for p in parts[1:]) else 'function'
+            names[parts[0].split('=', 1)[0]] = 'data' if 'DATA' in (p.upper() for p in parts[1:]) else 'function'
     return names
 
 
@@ -131,8 +134,9 @@ def strip_comments(text):
 
 def defined_in(path, name):
     text = strip_comments(open(path, encoding='utf-8').read())
-    return re.search(r'\b' + re.escape(name) + r'\s*(\(|=|;|\s)', text) is not None and re.search(
-        r'(^|\n)[^\n;]*\b' + re.escape(name) + r'\s*\([^;{]*\)\s*\{', text) is not None
+    # a definition: a return type at the start of a line, then the name and its parameters, then the body (not a call in an `if`)
+    return re.search(r'^[ \t]*(?:extern\s+"C"\s+)?(?:[\w:*&<>]+[ \t*&]+)+' + re.escape(name) + r'\s*\([^;{]*\)\s*(?:const\s*)?\{',
+                     text, re.M) is not None
 
 
 def main():
