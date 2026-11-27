@@ -11,8 +11,11 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
+#include <cstdlib>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <filesystem>
 #include <map>
@@ -181,21 +184,32 @@ bool scan(Node& dir, std::string& msg) {
 }
 
 // [fs] scan_threads (C1, startup): the same tree as scan, read with FindFirstFileExW (FindExInfoBasic, large fetches: the name, attributes and
-// size come with each entry, no stat per file) and the subfolders below the first two levels shared out over a few threads. Fortune's Weave's
-// RomFS is ~252,000 files in ~21,000 folders, and scan took ~4.5 s of every start on the laptop (the main thread waits for it at the game's
-// first file access). Same checks and the same error messages as scan.
+// size come with each entry, no stat per file), every folder a task for a few threads. Fortune's Weave's RomFS is ~252,000 files in ~21,000
+// folders, and scan took ~4.5 s of every start on the laptop (the main thread waits for it at the game's first file access). Same checks and
+// messages as scan: a symbolic link and a junction are refused as there; other reparse points (compressed files of `compact /exe` or
+// CompactGUI, deduplicated or cloud files) are plain files and folders, as std::filesystem treats them.
 struct FastScan {
     std::mutex mu;
+    std::condition_variable cv;
     std::vector<Node*> work;      // folders still to read
-    std::atomic<int> busy{0};     // threads reading a folder now
+    int busy = 0;                 // threads reading a folder now (under mu)
     std::string msg;              // the first error
-    std::atomic<bool> failed{false};
+    bool failed = false;
 };
+
+// dir.host without a trailing separator (a folder named "game/romfs/" in the ini), so that a child's path has one; a drive root keeps it.
+std::wstring host_base(const std::wstring& h) {
+    std::wstring b = h;
+    while (b.size() > 1 && (b.back() == L'\\' || b.back() == L'/') && !(b.size() >= 2 && b[b.size() - 2] == L':')) b.pop_back();
+    return b;
+}
 
 // Reads one folder's entries into dir.kids (subfolders are left empty and returned in subdirs).
 bool scan_one(Node& dir, std::vector<Node*>& subdirs, std::string& msg) {
+    const std::wstring base = host_base(dir.host);
+    const bool sep = !base.empty() && base.back() == L'\\';
     WIN32_FIND_DATAW fd;
-    const std::wstring pat = dir.host + L"\\*";
+    const std::wstring pat = base + (sep ? L"*" : L"\\*");
     HANDLE h = FindFirstFileExW(pat.c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
     if (h == INVALID_HANDLE_VALUE) {
         if (GetLastError() == ERROR_FILE_NOT_FOUND) return true;   // an empty folder (no "." entry on some file systems)
@@ -220,11 +234,19 @@ bool scan_one(Node& dir, std::vector<Node*>& subdirs, std::string& msg) {
             ok = false;
             break;
         }
-        k.host = long_path(dir.host + L"\\" + w);
+        k.host = long_path(base + (sep ? L"" : L"\\") + w);
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
-            msg = "symbolic link cannot be described: " + k.path;
-            ok = false;
-            break;
+            // dwReserved0 is the reparse tag here (as std::filesystem's symlink_status reads it)
+            if (fd.dwReserved0 == IO_REPARSE_TAG_SYMLINK) {
+                msg = "symbolic link cannot be described: " + k.path;
+                ok = false;
+                break;
+            }
+            if (fd.dwReserved0 == IO_REPARSE_TAG_MOUNT_POINT) {
+                msg = "not a file or folder: " + k.path;
+                ok = false;
+                break;
+            }
         }
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
             k.is_dir = true;
@@ -253,40 +275,34 @@ bool scan_parallel(Node& root, int threads, std::string& msg) {
         for (;;) {
             Node* d = nullptr;
             {
-                std::lock_guard lk(st.mu);
-                if (!st.work.empty() && !st.failed.load()) {
-                    d = st.work.back();
-                    st.work.pop_back();
-                    st.busy.fetch_add(1);
-                }
-            }
-            if (!d) {
-                if (st.failed.load() || st.busy.load() == 0) {
-                    std::lock_guard lk(st.mu);
-                    if (st.work.empty() || st.failed.load()) return;
-                }
-                std::this_thread::yield();
-                continue;
+                std::unique_lock lk(st.mu);
+                // wait for a folder, or for the end: nothing queued and nobody reading (no more can come), or an error
+                st.cv.wait(lk, [&] { return st.failed || !st.work.empty() || st.busy == 0; });
+                if (st.failed || st.work.empty()) return;
+                d = st.work.back();
+                st.work.pop_back();
+                st.busy++;
             }
             sub.clear();
             std::string m;
             const bool ok = scan_one(*d, sub, m);
             {
                 std::lock_guard lk(st.mu);
-                if (!ok && !st.failed.load()) {
-                    st.failed.store(true);
+                if (!ok && !st.failed) {
+                    st.failed = true;
                     st.msg = m;
                 }
                 st.work.insert(st.work.end(), sub.begin(), sub.end());
+                st.busy--;
             }
-            st.busy.fetch_sub(1);
+            st.cv.notify_all();
         }
     };
     std::vector<std::thread> pool;
     for (int i = 1; i < threads; ++i) pool.emplace_back(worker);
     worker();
     for (auto& t : pool) t.join();
-    if (st.failed.load()) {
+    if (st.failed) {
         msg = st.msg;
         return false;
     }
@@ -295,23 +311,31 @@ bool scan_parallel(Node& root, int threads, std::string& msg) {
 
 int scan_threads() {
     static const int n = [] {
-        const std::string v = nxrt::config_get_str("fs", "scan_threads", "auto");
-        if (v == "auto" || v.empty()) {
-            const unsigned hw = std::thread::hardware_concurrency();
-            return static_cast<int>(std::clamp<unsigned>(hw / 2, 1u, 8u));
+        const unsigned hw = std::thread::hardware_concurrency();
+        const int fallback = static_cast<int>(std::clamp<unsigned>(hw / 2, 1u, 8u));
+        std::string v = nxrt::config_get_str("fs", "scan_threads", "auto");
+        for (char& c : v) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (v.empty() || v == "auto") return fallback;
+        char* end = nullptr;
+        const long x = std::strtol(v.c_str(), &end, 10);
+        if (!end || *end || x < 0) {
+            NXLOG_W("fs", "[fs] scan_threads = '%s' is not a number or auto: auto (%d threads) is used", v.c_str(), fallback);
+            return fallback;
         }
-        return std::clamp(std::atoi(v.c_str()), 0, 32);
+        return static_cast<int>(std::min<long>(x, 32));
     }();
     return n;
 }
 
-// The host tree into dir: scan_parallel, or scan with [fs] scan_threads = 0. Logs how long it took.
+// The host tree into dir: scan_parallel, or scan with [fs] scan_threads = 0. Logs how long it took and for which folder.
 bool scan_tree(Node& dir, std::string& msg) {
     const auto t0 = std::chrono::steady_clock::now();
     const int n = scan_threads();
     const bool ok = n > 0 ? scan_parallel(dir, n, msg) : scan(dir, msg);
     const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    NXLOG_I("fs", "romfs: folder %s read in %.2f s (%s)", shown(dir).c_str(), s,
+    std::string where;
+    if (!to_utf8(dir.host, where)) where = "?";
+    NXLOG_I("fs", "romfs: folder %s read in %.2f s (%s)", where.c_str(), s,
             n > 0 ? (std::to_string(n) + " threads, [fs] scan_threads").c_str() : "one thread, [fs] scan_threads = 0");
     return ok;
 }
