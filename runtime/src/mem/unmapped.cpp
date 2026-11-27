@@ -17,6 +17,14 @@
 // maps lives below 4 GiB (code at 0x7100000000, the heap and stacks higher), and the granules are given back if the guest maps there.
 // Each new granule is logged once (from a logging thread, not the handler), with the guest function that read it; at most 4096
 // granules (256 MiB of address space), then faults crash as before. [memory] unmapped_access = crash: the old behaviour.
+//
+// Host memory is kept low on purpose (the exe has no high-entropy addresses, so the guest ranges at 0x71_0000_0000 and up stay free),
+// so a raw offset of a few MB can also land in a range Windows reserved for one of our own allocations, such as the reserved tail of a
+// heap segment created before the runtime ran (seen at 0x200000 on a 13700K desktop, where the free-granule rule above refused it and
+// the game crashed). A READ of a page that is MEM_RESERVE in a private allocation that is not a thread stack (no guard page in it) gets
+// that one page committed (zero-filled, read-write as the owner would commit it): it reads 0, as on the emulators, and the owner can
+// still commit and use it later (committing a committed page succeeds and leaves its zeros). Writes into such reserved pages, stacks,
+// and pages already committed are left alone (a read of committed host memory does not fault and reads what is there, as before).
 #include "nxrt/memory.h"
 
 #define WIN32_LEAN_AND_MEAN
@@ -45,6 +53,7 @@ struct Entry {
     std::atomic<uint64_t> granule{0};   // 0: empty
     uint64_t addr = 0, rip = 0;
     bool write = false;
+    bool borrowed = false;   // one page committed inside another allocation's reservation: never released here
     std::atomic<bool> ready{false};
 };
 Entry g_entries[kMaxGranules];
@@ -52,6 +61,47 @@ std::atomic<int> g_used{0};
 std::atomic<uint64_t> g_faults{0};
 std::atomic<bool> g_on{false};
 void* g_veh = nullptr;
+
+// True when the allocation that holds `base` has a guard page: a thread stack, which grows into its reserved part page by page.
+bool is_stack(void* alloc_base) {
+    uint8_t* p = static_cast<uint8_t*>(alloc_base);
+    for (int i = 0; i < 4096; ++i) {
+        MEMORY_BASIC_INFORMATION r{};
+        if (!VirtualQuery(p, &r, sizeof r) || r.AllocationBase != alloc_base) return false;
+        if (r.State == MEM_COMMIT && (r.Protect & PAGE_GUARD)) return true;
+        p = static_cast<uint8_t*>(r.BaseAddress) + r.RegionSize;
+    }
+    return true;   // too many pieces to tell: leave it alone
+}
+
+LONG borrow_page(EXCEPTION_POINTERS* ep, uint64_t addr) {
+    const uint64_t page = addr & ~uint64_t(0xfff);
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(reinterpret_cast<void*>(page), &mbi, sizeof mbi)) return EXCEPTION_CONTINUE_SEARCH;
+    if (mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+        return EXCEPTION_CONTINUE_EXECUTION;   // readable by now (another thread's fault on the same page committed it): the read runs
+    if (mbi.State != MEM_RESERVE || mbi.Type != MEM_PRIVATE || is_stack(mbi.AllocationBase)) return EXCEPTION_CONTINUE_SEARCH;
+    ULONG_PTR lo = 0, hi = 0;
+    GetCurrentThreadStackLimits(&lo, &hi);
+    if (page >= lo && page < hi) return EXCEPTION_CONTINUE_SEARCH;   // this thread's own stack
+    const int slot = g_used.fetch_add(1, std::memory_order_relaxed);
+    if (slot >= kMaxGranules) return EXCEPTION_CONTINUE_SEARCH;
+    if (!VirtualAlloc(reinterpret_cast<void*>(page), 0x1000, MEM_COMMIT, PAGE_READWRITE)) {
+        // another thread committed it first (both faulted on the same page): run again if it reads now
+        if (VirtualQuery(reinterpret_cast<void*>(page), &mbi, sizeof mbi) && mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+            return EXCEPTION_CONTINUE_EXECUTION;
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    Entry& e = g_entries[slot];
+    e.addr = addr;
+    e.rip = static_cast<uint64_t>(ep->ContextRecord->Rip);
+    e.write = false;
+    e.borrowed = true;
+    e.granule.store(page, std::memory_order_relaxed);
+    e.ready.store(true, std::memory_order_release);
+    g_faults.fetch_add(1, std::memory_order_relaxed);
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
 
 LONG CALLBACK on_fault(EXCEPTION_POINTERS* ep) {
     const EXCEPTION_RECORD* er = ep->ExceptionRecord;
@@ -62,10 +112,10 @@ LONG CALLBACK on_fault(EXCEPTION_POINTERS* ep) {
     if ((kind != 0 && kind != 1) || addr < kLow || addr >= kHigh || !kernel::current_ctx()) return EXCEPTION_CONTINUE_SEARCH;
     const uint64_t granule = addr & ~(kGranule - 1);
     MEMORY_BASIC_INFORMATION mbi{};
-    if (!VirtualQuery(reinterpret_cast<void*>(granule), &mbi, sizeof mbi) || mbi.State != MEM_FREE ||
-        reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize < granule + kGranule)
-        return EXCEPTION_CONTINUE_SEARCH;   // not wholly free: someone's (or one of ours mapped by another thread just now: run again)
+    if (!VirtualQuery(reinterpret_cast<void*>(granule), &mbi, sizeof mbi)) return EXCEPTION_CONTINUE_SEARCH;
     if (vm_query(granule).state != kMemFree) return EXCEPTION_CONTINUE_SEARCH;
+    if (mbi.State != MEM_FREE || reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize < granule + kGranule)
+        return kind == 0 ? borrow_page(ep, addr) : EXCEPTION_CONTINUE_SEARCH;   // not wholly free: a read may still borrow one page
     const int slot = g_used.fetch_add(1, std::memory_order_relaxed);
     if (slot >= kMaxGranules) return EXCEPTION_CONTINUE_SEARCH;
     if (!VirtualAlloc(reinterpret_cast<void*>(granule), kGranule, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)) {
@@ -93,7 +143,10 @@ void log_thread() {
             const uint64_t fn = guest_function_of(e.rip);
             NXLOG_W(kTag, "unmapped %s at 0x%llx (guest function f_%llx): answered as the emulators do, %s ([memory] unmapped_access = zero; "
                     "a broken mod table is the usual cause)", e.write ? "write" : "read", static_cast<unsigned long long>(e.addr),
-                    static_cast<unsigned long long>(fn), e.write ? "the write kept in zeroed memory mapped there" : "it reads 0");
+                    static_cast<unsigned long long>(fn),
+                    e.write      ? "the write kept in zeroed memory mapped there"
+                    : e.borrowed ? "it reads 0 (one zero page committed in a host reservation there)"
+                                 : "it reads 0");
         }
         if (logged >= kMaxGranules) {
             NXLOG_W(kTag, "unmapped accesses: %d granules mapped, the most there may be: further ones crash", kMaxGranules);
@@ -130,7 +183,7 @@ void unmapped_release(uint64_t addr, uint64_t size) {
     for (int i = 0; i < n; ++i) {
         uint64_t g = g_entries[i].granule.load(std::memory_order_relaxed);
         const uint64_t was = g;
-        if (g && g < addr + size && g + kGranule > addr && g_entries[i].granule.compare_exchange_strong(g, 0)) {
+        if (g && !g_entries[i].borrowed && g < addr + size && g + kGranule > addr && g_entries[i].granule.compare_exchange_strong(g, 0)) {
             g = was;
             VirtualFree(reinterpret_cast<void*>(g), 0, MEM_RELEASE);
             NXLOG_I(kTag, "unmapped accesses: the zeroed granule at 0x%llx given back (the guest maps there)", static_cast<unsigned long long>(g));
