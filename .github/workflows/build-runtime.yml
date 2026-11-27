@@ -10,6 +10,16 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Every function and variable the recomp headers leave to the runtime must be exported by fefw_rt.dll (fefw_rt.def) or defined in
+  # fefw_hle.cpp, or Set up's link of ObeliskChamber.exe fails on players' PCs; the build below never links lifted code, so it can't see it.
+  exports:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - name: recomp header declarations vs fefw_rt.def, fefw_hle.cpp and link_check.cpp
+        run: python3 tools/ci/check_exports.py --clang clang++
+
   fefw_rt:
     runs-on: windows-latest
     timeout-minutes: 150

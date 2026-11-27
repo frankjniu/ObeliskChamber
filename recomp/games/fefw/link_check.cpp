@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Link check of the Fortune's Weave module libraries (target fefw_link_check): the six libraries plus stubs for every function ctx.h
-// declares as runtime-provided. Linking proves that each f_<addr> / u_<addr> the generated code references is defined exactly once;
+// declares as runtime-provided, and for the nx_hle_* bodies of game-build/fefw/src/fefw_hle.cpp (tools/check_exports.py keeps the
+// list complete). Linking proves that each f_<addr> / u_<addr> the generated code references is defined exactly once;
 // running it prints each module descriptor and checks its tables against the bases of config.py. It runs no game code.
 #include <nxrecomp/ctx.h>
 
@@ -24,6 +25,10 @@ int nx_site_midhook(Ctx *, uint64_t) { std::abort(); }
 int nx_hook_entry(Ctx *, uint64_t) { std::abort(); }
 void stx_diag(Ctx *, uint64_t, uint64_t, uint64_t, uint64_t, int) {}
 void nx_catch_call(Ctx *, void (*)(Ctx *, uint64_t)) { std::abort(); }
+// game-build/fefw/src/fefw_hle.cpp (compiled into fefw.exe with the lifted libraries; recomp cxx.h): the lifted body is the fallback
+void nx_hle_zstd_multiframe(Ctx *c, void (*orig)(Ctx *)) { orig(c); }
+void nx_hle_cull_view_box(Ctx *c, void (*orig)(Ctx *)) { orig(c); }
+void nx_hle_cull_cylinder_box(Ctx *c, void (*orig)(Ctx *)) { orig(c); }
 
 extern const NxModule nxmod_main, nxmod_sdk, nxmod_subsdk0, nxmod_subsdk1, nxmod_subsdk2, nxmod_rtld;
 extern const uint32_t nxmod_main_abi, nxmod_sdk_abi, nxmod_subsdk0_abi, nxmod_subsdk1_abi, nxmod_subsdk2_abi, nxmod_rtld_abi;
