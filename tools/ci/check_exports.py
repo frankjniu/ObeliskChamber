@@ -26,34 +26,38 @@ LINK_CHECK = os.path.join(ROOT, 'recomp', 'games', 'fefw', 'link_check.cpp')
 
 # The macro sets the game is built with (game-build/release/fefw_build.py, recomp/games/fefw/CMakeLists.txt): a declaration behind
 # #ifdef (nx_fn_flat under NX_INLINE_INDIRECT) only shows when its macro is set, so the union over these sets is checked.
-DEFINE_SETS = [
-    [],
-    ['NX_INLINE_INDIRECT', 'NX_NOESCAPE_CTX', 'NX_FAST_FMA'],
+DEFINE_SETS = [   # (macros, target flags): plain; the 'fma' release variant; the 'compat' variant (NX_FAST_FMA without hardware FMA)
+    ([], ['-mcx16']),
+    (['NX_INLINE_INDIRECT', 'NX_NOESCAPE_CTX', 'NX_FAST_FMA'], ['-mcx16', '-mfma']),
+    (['NX_INLINE_INDIRECT', 'NX_NOESCAPE_CTX', 'NX_FAST_FMA'], ['-mcx16', '-msse4.2', '-mpopcnt']),
 ]
-TARGET_FLAGS = ['-mfma', '-mcx16', '-mpopcnt']   # the release 'fma' variant's features, plus popcnt (as 'compat')
 
 
 def declared(clang):
     found = {}
-    for defs in DEFINE_SETS:
-        found.update(declared_with(clang, defs))
+    for defs, flags in DEFINE_SETS:
+        found.update(declared_with(clang, defs, flags))
     return found
 
 
-def declared_with(clang, defs):
+def declared_with(clang, defs, flags):
     headers = sorted(h for h in os.listdir(HDR_DIR) if h.endswith('.h'))
     with tempfile.NamedTemporaryFile('w', suffix='.cpp', delete=False) as f:
         for h in headers:
             f.write(f'#include <nxrecomp/{h}>\n')
         tu = f.name
     try:
-        out = subprocess.run([clang, '-std=c++20', '-fsyntax-only', '-w', f'-I{INC}', *TARGET_FLAGS, *(f'-D{d}' for d in defs),
+        out = subprocess.run([clang, '-std=c++20', '-fsyntax-only', '-w', f'-I{INC}', *flags, *(f'-D{d}' for d in defs),
                               '-Xclang', '-ast-dump=json', tu],
-                             check=True, capture_output=True, text=True).stdout
+                             capture_output=True, text=True)
+        if out.returncode:
+            sys.exit(f'clang could not parse the recomp headers ({" ".join(defs)} {" ".join(flags)}):\n{out.stderr[-4000:]}')
+        out = out.stdout
     finally:
         os.unlink(tu)
     ast = json.loads(out)
     found = {}
+    defined_here = set()
     cur = {'file': None}
 
     def note_file(n):
@@ -79,7 +83,9 @@ def declared_with(clang, defs):
         if kind == 'FunctionDecl' and in_headers():
             has_body = any(ch.get('kind') == 'CompoundStmt' for ch in n.get('inner', []))
             # implicit: compiler builtins (__atomic_*, __builtin_*) clang declares where they are first used
-            if c_linkage and not has_body and not n.get('isImplicit') and not n.get('inline') and n.get('storageClass') != 'static':
+            if has_body:
+                defined_here.add(n['name'])
+            elif c_linkage and not n.get('isImplicit') and not n.get('inline') and n.get('storageClass') != 'static':
                 found[n['name']] = 'function'
         elif kind == 'VarDecl' and in_headers():
             # `extern "C" T x;` (no braces) is a declaration too: clang gives it no storage class, and no initialiser
@@ -88,7 +94,7 @@ def declared_with(clang, defs):
                     and not n.get('isImplicit'):
                 found[n['name']] = 'data'
         for ch in n.get('inner', []) if kind in ('TranslationUnitDecl', 'NamespaceDecl') else []:
-            walk(ch, c_linkage)
+            walk(ch, c_linkage, braces)
         # other nodes: still track the file their children report, so later siblings get the right one
         if kind not in ('TranslationUnitDecl', 'NamespaceDecl'):
             stack = list(n.get('inner', []))
@@ -98,7 +104,7 @@ def declared_with(clang, defs):
                 stack[0:0] = ch.get('inner', [])
 
     walk(ast, False)
-    return found
+    return {k: v for k, v in found.items() if k not in defined_here}
 
 
 def def_exports():
@@ -117,8 +123,14 @@ def def_exports():
     return names
 
 
+def strip_comments(text):
+    text = re.sub(r'/\*.*?\*/', ' ', text, flags=re.S)
+    text = re.sub(r'//[^\n]*', ' ', text)
+    return re.sub(r'^\s*#\s*if\s+0\b.*?^\s*#\s*endif\b', ' ', text, flags=re.S | re.M)
+
+
 def defined_in(path, name):
-    text = open(path, encoding='utf-8').read()
+    text = strip_comments(open(path, encoding='utf-8').read())
     return re.search(r'\b' + re.escape(name) + r'\s*(\(|=|;|\s)', text) is not None and re.search(
         r'(^|\n)[^\n;]*\b' + re.escape(name) + r'\s*\([^;{]*\)\s*\{', text) is not None
 
@@ -129,7 +141,7 @@ def main():
     a = ap.parse_args()
     decl = declared(a.clang)
     exports = def_exports()
-    link_check = open(LINK_CHECK, encoding='utf-8').read()
+    link_check = strip_comments(open(LINK_CHECK, encoding='utf-8').read())
     bad = []
     for name, kind in sorted(decl.items()):
         where = None

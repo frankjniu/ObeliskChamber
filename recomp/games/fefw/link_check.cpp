@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Link check of the Fortune's Weave module libraries (target fefw_link_check): the six libraries plus stubs for every function ctx.h
-// declares as runtime-provided, and for the nx_hle_* bodies of game-build/fefw/src/fefw_hle.cpp (tools/check_exports.py keeps the
+// declares as runtime-provided, and for the nx_hle_* bodies of game-build/fefw/src/fefw_hle.cpp (tools/ci/check_exports.py keeps the
 // list complete). Linking proves that each f_<addr> / u_<addr> the generated code references is defined exactly once;
 // running it prints each module descriptor and checks its tables against the bases of config.py. It runs no game code.
 #include <nxrecomp/ctx.h>
