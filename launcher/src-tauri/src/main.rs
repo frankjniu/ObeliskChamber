@@ -9,6 +9,7 @@ mod ini;
 mod locale;
 mod nup;
 mod play;
+mod prepare;
 mod settings;
 mod setup;
 mod steam;
@@ -101,6 +102,12 @@ fn game_dir_of(cfg: &Config, repo: &Path) -> PathBuf {
     } else {
         PathBuf::from(cfg.game_dir.trim())
     }
+}
+
+/// Where a .nup is unpacked: `nup_dump` in the install folder of the release package, `<repo>/game/nup_dump` in a checkout.
+fn nup_dir(cfg: &Config) -> Result<PathBuf, String> {
+    let repo = need_repo(cfg)?;
+    Ok(if package_tools().is_some() { game_dir_of(cfg, &repo).join("nup_dump") } else { repo.join("game").join("nup_dump") })
 }
 
 fn need_repo(cfg: &Config) -> Result<PathBuf, String> {
@@ -255,9 +262,7 @@ async fn import_nup(app: AppHandle, state: State<'_, Arc<setup::Shared>>, path: 
     if state.progress.lock().unwrap().state == "running" {
         return Err("Setup is running. Pause it first.".into());
     }
-    let cfg = load_config(&app);
-    let repo = need_repo(&cfg)?;
-    let out = if package_tools().is_some() { game_dir_of(&cfg, &repo).join("nup_dump") } else { repo.join("game").join("nup_dump") };
+    let out = nup_dir(&load_config(&app))?;
     let src = PathBuf::from(path.trim());
     let emitter = app.clone();
     let res = tauri::async_runtime::spawn_blocking(move || {
@@ -688,6 +693,10 @@ fn restart_launcher(app: AppHandle) -> Result<(), String> {
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if prepare::wanted(&args) {
+        std::process::exit(prepare::run(&args));
+    }
     if package_tools().is_some() {
         update::cleanup(&exe_dir());
     }

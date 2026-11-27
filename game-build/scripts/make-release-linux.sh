@@ -66,6 +66,9 @@ top=$(find "$STAGE/win" -mindepth 1 -maxdepth 1 -type d | head -1)
 [ -f "$top/fefw_rt.dll" ] && [ -f "$top/tools/build/sdk/fefw_rt.lib" ] || { echo "$WIN_ZIP is not a make-release.ps1 package" >&2; exit 1; }
 mv "$top" "$PKG"
 rm -rf "$STAGE/win" "$PKG/ObeliskChamber-launcher.exe" "$PKG/tools/python" "$PKG/tools/build/zig" "$PKG/tools/spirv_harness"
+# recomplauncher.json describes the Windows package (ObeliskChamber-launcher.exe --prepare); the Linux one is not tried with
+# RecompLauncher yet, so this package goes without it until it is
+rm -f "$PKG/recomplauncher.json"
 
 echo "--- launcher (AppImage)"
 (

@@ -1,0 +1,686 @@
+{
+  "$schema": "https://recomplauncher.com/schema/recomplauncher.json",
+  "format": 1,
+  "name": "ObeliskChamber",
+  "repo": "xinthefreefallxai/ObeliskChamber",
+  "system": {
+    "windows": {
+      "version": "10",
+      "graphics": {
+        "vulkan": "1.3"
+      }
+    }
+  },
+  "inputs": [
+    {
+      "id": "game",
+      "role": "game",
+      "label": "Your own decrypted dump of Fire Emblem: Fortune's Weave (Nintendo Switch 2) at update 131072: its .nup package, or the folder that has exefs and romfs directly in it (for a dump kept as base/ and updates/, pick the .nup instead). Optional DLC goes in a dlc folder inside that folder. A folder dump stays where it is and the game reads it while you play, so keep it there.",
+      "formats": [
+        {
+          "type": "file",
+          "extensions": [
+            "nup"
+          ]
+        },
+        {
+          "type": "folder"
+        }
+      ],
+      "check": {
+        "nup_build_id": "db93b0125f4850601d61c3edde012f8eb2ecfe77"
+      }
+    }
+  ],
+  "prepare": {
+    "program": [
+      "ObeliskChamber-launcher.exe"
+    ],
+    "args": [
+      "--prepare",
+      "--game={input:game}"
+    ],
+    "label": "Building the game from your dump (an hour or more the first time)",
+    "done": [
+      "{install}/ObeliskChamber.exe"
+    ]
+  },
+  "start": {
+    "program": [
+      "ObeliskChamber.exe"
+    ]
+  },
+  "saves": [
+    "{install}/save"
+  ],
+  "folders": {
+    "saves": [
+      {
+        "path": "{install}/save"
+      }
+    ],
+    "logs": [
+      {
+        "path": "{install}"
+      }
+    ],
+    "mods": [
+      {
+        "path": "{install}/mods"
+      }
+    ]
+  },
+  "actions": [
+    {
+      "id": "open_mods",
+      "label": "Open the mods folder",
+      "open": "mods"
+    }
+  ],
+  "config": [
+    {
+      "id": "main",
+      "format": "ini",
+      "file": [
+        {
+          "path": "{install}/ObeliskChamber.ini"
+        }
+      ]
+    }
+  ],
+  "groups": [
+    {
+      "id": "Video memory",
+      "advanced": true
+    }
+  ],
+  "settings": [
+    {
+      "id": "preset",
+      "label": "Graphics preset",
+      "help": "Sets render scale, shadow map size, quality and the four detail settings together. Medium is the console's picture. Output resolution and the upscaler are not changed.",
+      "group": "Picture",
+      "defaults": {
+        "fefw/render_ratio": "0",
+        "fefw/shadow_size": "0",
+        "fefw/quality": "console",
+        "fefw/reflections": "full",
+        "fefw/ambient_occlusion": "1",
+        "fefw/crowd_detail": "full",
+        "fefw/scenery_detail": "full"
+      },
+      "choices": [
+        {
+          "label": "Low",
+          "set": {
+            "fefw/render_ratio": "0.5",
+            "fefw/shadow_size": "1024",
+            "fefw/quality": "handheld",
+            "fefw/reflections": "reduced",
+            "fefw/ambient_occlusion": "0",
+            "fefw/crowd_detail": "reduced",
+            "fefw/scenery_detail": "reduced"
+          }
+        },
+        {
+          "label": "Medium (console)",
+          "set": {
+            "fefw/render_ratio": "0",
+            "fefw/shadow_size": "0",
+            "fefw/quality": "console",
+            "fefw/reflections": "full",
+            "fefw/ambient_occlusion": "1",
+            "fefw/crowd_detail": "full",
+            "fefw/scenery_detail": "full"
+          }
+        },
+        {
+          "label": "High",
+          "set": {
+            "fefw/render_ratio": "0.67",
+            "fefw/shadow_size": "4096",
+            "fefw/quality": "docked",
+            "fefw/reflections": "full",
+            "fefw/ambient_occlusion": "1",
+            "fefw/crowd_detail": "full",
+            "fefw/scenery_detail": "full"
+          }
+        },
+        {
+          "label": "Ultra",
+          "set": {
+            "fefw/render_ratio": "1.0",
+            "fefw/shadow_size": "8192",
+            "fefw/quality": "docked",
+            "fefw/reflections": "full",
+            "fefw/ambient_occlusion": "1",
+            "fefw/crowd_detail": "full",
+            "fefw/scenery_detail": "full"
+          }
+        }
+      ]
+    },
+    {
+      "id": "output",
+      "label": "Output resolution",
+      "help": "The size the game draws its picture, menus and effects at, not the size of the window. For an ultrawide monitor pick its size and keep Ultrawide on Auto. Applies at the next start.",
+      "group": "Picture",
+      "defaults": {
+        "fefw/output": "console"
+      },
+      "choices": [
+        {
+          "label": "Console (docked 1440p)",
+          "set": {
+            "fefw/output": "console"
+          }
+        },
+        {
+          "label": "1280 x 720",
+          "set": {
+            "fefw/output": "720p"
+          }
+        },
+        {
+          "label": "1920 x 1080",
+          "set": {
+            "fefw/output": "1080p"
+          }
+        },
+        {
+          "label": "2560 x 1440",
+          "set": {
+            "fefw/output": "1440p"
+          }
+        },
+        {
+          "label": "3840 x 2160 (4K)",
+          "set": {
+            "fefw/output": "2160p"
+          }
+        },
+        {
+          "label": "2560 x 1080 (21:9)",
+          "set": {
+            "fefw/output": "2560x1080"
+          }
+        },
+        {
+          "label": "3440 x 1440 (21:9)",
+          "set": {
+            "fefw/output": "3440x1440"
+          }
+        },
+        {
+          "label": "3840 x 1600 (21:9)",
+          "set": {
+            "fefw/output": "3840x1600"
+          }
+        },
+        {
+          "label": "5120 x 2160 (21:9)",
+          "set": {
+            "fefw/output": "5120x2160"
+          }
+        },
+        {
+          "label": "3840 x 1080 (32:9)",
+          "set": {
+            "fefw/output": "3840x1080"
+          }
+        },
+        {
+          "label": "5120 x 1440 (32:9)",
+          "set": {
+            "fefw/output": "5120x1440"
+          }
+        },
+        {
+          "label": "Window size at start",
+          "set": {
+            "fefw/output": "window"
+          }
+        }
+      ]
+    },
+    {
+      "id": "ultrawide",
+      "label": "Ultrawide",
+      "help": "Auto: with a 21:9 or 32:9 output resolution the 3D view gets wider while menus and movies stay at 16:9. Off stretches the 16:9 picture.",
+      "group": "Picture",
+      "defaults": {
+        "fefw/ultrawide": "auto"
+      },
+      "choices": [
+        {
+          "label": "Auto",
+          "set": {
+            "fefw/ultrawide": "auto"
+          }
+        },
+        {
+          "label": "Off",
+          "set": {
+            "fefw/ultrawide": "off"
+          }
+        }
+      ]
+    },
+    {
+      "id": "render_ratio",
+      "label": "Render scale",
+      "help": "The 3D picture's size per side, as a share of the output. The upscaler fills in the rest.",
+      "group": "Picture",
+      "defaults": {
+        "fefw/render_ratio": "0"
+      },
+      "choices": [
+        {
+          "label": "Game's own (50%)",
+          "set": {
+            "fefw/render_ratio": "0"
+          }
+        },
+        {
+          "label": "33%",
+          "set": {
+            "fefw/render_ratio": "0.33"
+          }
+        },
+        {
+          "label": "50%",
+          "set": {
+            "fefw/render_ratio": "0.5"
+          }
+        },
+        {
+          "label": "59%",
+          "set": {
+            "fefw/render_ratio": "0.59"
+          }
+        },
+        {
+          "label": "67%",
+          "set": {
+            "fefw/render_ratio": "0.67"
+          }
+        },
+        {
+          "label": "75%",
+          "set": {
+            "fefw/render_ratio": "0.75"
+          }
+        },
+        {
+          "label": "85%",
+          "set": {
+            "fefw/render_ratio": "0.85"
+          }
+        },
+        {
+          "label": "100% (native, sharpest)",
+          "set": {
+            "fefw/render_ratio": "1.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "upscaler",
+      "label": "Upscaler",
+      "help": "Stands in for the console's DLSS. TAAU needs no extra files; DLSS, FSR 3 and XeSS need their vendor's files (see the README), and without them the game uses TAAU. Applies at the next start.",
+      "group": "Picture",
+      "defaults": {
+        "dlss/upscaler": "taau"
+      },
+      "choices": [
+        {
+          "label": "Built-in temporal (TAAU)",
+          "set": {
+            "dlss/upscaler": "taau"
+          }
+        },
+        {
+          "label": "NVIDIA DLSS",
+          "set": {
+            "dlss/upscaler": "dlss"
+          }
+        },
+        {
+          "label": "AMD FSR 3",
+          "set": {
+            "dlss/upscaler": "fsr3"
+          }
+        },
+        {
+          "label": "Intel XeSS",
+          "set": {
+            "dlss/upscaler": "xess"
+          }
+        },
+        {
+          "label": "Bilinear",
+          "set": {
+            "dlss/upscaler": "bilinear"
+          }
+        },
+        {
+          "label": "Automatic (DLSS, else XeSS, else FSR 3, else TAAU)",
+          "set": {
+            "dlss/upscaler": "auto"
+          }
+        }
+      ]
+    },
+    {
+      "id": "quality",
+      "label": "Quality",
+      "help": "Which of the game's two effect levels it uses.",
+      "group": "Detail",
+      "defaults": {
+        "fefw/quality": "console"
+      },
+      "choices": [
+        {
+          "label": "As the console picks",
+          "set": {
+            "fefw/quality": "console"
+          }
+        },
+        {
+          "label": "Always docked quality",
+          "set": {
+            "fefw/quality": "docked"
+          }
+        },
+        {
+          "label": "Always handheld quality (lighter)",
+          "set": {
+            "fefw/quality": "handheld"
+          }
+        }
+      ]
+    },
+    {
+      "id": "shadow_size",
+      "label": "Shadow map size",
+      "help": "Sharper shadows cost video memory and GPU time.",
+      "group": "Detail",
+      "defaults": {
+        "fefw/shadow_size": "0"
+      },
+      "choices": [
+        {
+          "label": "Game's own",
+          "set": {
+            "fefw/shadow_size": "0"
+          }
+        },
+        {
+          "label": "1024",
+          "set": {
+            "fefw/shadow_size": "1024"
+          }
+        },
+        {
+          "label": "1536",
+          "set": {
+            "fefw/shadow_size": "1536"
+          }
+        },
+        {
+          "label": "2048",
+          "set": {
+            "fefw/shadow_size": "2048"
+          }
+        },
+        {
+          "label": "3072",
+          "set": {
+            "fefw/shadow_size": "3072"
+          }
+        },
+        {
+          "label": "4096",
+          "set": {
+            "fefw/shadow_size": "4096"
+          }
+        },
+        {
+          "label": "6144",
+          "set": {
+            "fefw/shadow_size": "6144"
+          }
+        },
+        {
+          "label": "8192",
+          "set": {
+            "fefw/shadow_size": "8192"
+          }
+        }
+      ]
+    },
+    {
+      "id": "reflections",
+      "label": "Reflections",
+      "help": "Reflections on floors and water. Reduced mostly helps in the hubs. Applies at the next start.",
+      "group": "Detail",
+      "defaults": {
+        "fefw/reflections": "full"
+      },
+      "choices": [
+        {
+          "label": "Full",
+          "set": {
+            "fefw/reflections": "full"
+          }
+        },
+        {
+          "label": "Reduced",
+          "set": {
+            "fefw/reflections": "reduced"
+          }
+        },
+        {
+          "label": "Off",
+          "set": {
+            "fefw/reflections": "off"
+          }
+        }
+      ]
+    },
+    {
+      "id": "ambient_occlusion",
+      "label": "Ambient occlusion",
+      "help": "The soft shading in corners. Off saves GPU time, with flatter lighting. Applies at the next start.",
+      "group": "Detail",
+      "defaults": {
+        "fefw/ambient_occlusion": "1"
+      },
+      "choices": [
+        {
+          "label": "On",
+          "set": {
+            "fefw/ambient_occlusion": "1"
+          }
+        },
+        {
+          "label": "Off",
+          "set": {
+            "fefw/ambient_occlusion": "0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "crowd_detail",
+      "label": "Crowd detail",
+      "help": "Reduced switches crowds to their simpler models sooner. Applies at the next start.",
+      "group": "Detail",
+      "defaults": {
+        "fefw/crowd_detail": "full"
+      },
+      "choices": [
+        {
+          "label": "Full",
+          "set": {
+            "fefw/crowd_detail": "full"
+          }
+        },
+        {
+          "label": "Reduced",
+          "set": {
+            "fefw/crowd_detail": "reduced"
+          }
+        }
+      ]
+    },
+    {
+      "id": "scenery_detail",
+      "label": "Scenery detail",
+      "help": "Reduced switches scenery to its simpler versions sooner. Applies at the next start.",
+      "group": "Detail",
+      "defaults": {
+        "fefw/scenery_detail": "full"
+      },
+      "choices": [
+        {
+          "label": "Full",
+          "set": {
+            "fefw/scenery_detail": "full"
+          }
+        },
+        {
+          "label": "Reduced",
+          "set": {
+            "fefw/scenery_detail": "reduced"
+          }
+        }
+      ]
+    },
+    {
+      "id": "texture_detail",
+      "label": "Texture detail",
+      "help": "Half keeps the large textures at half size, as the console does. Pick it if the game slows down in big areas. Applies at the next start.",
+      "group": "Video memory",
+      "defaults": {
+        "gfx/texture_detail": "auto"
+      },
+      "choices": [
+        {
+          "label": "Automatic (half below 9 GB of video memory)",
+          "set": {
+            "gfx/texture_detail": "auto"
+          }
+        },
+        {
+          "label": "Full",
+          "set": {
+            "gfx/texture_detail": "full"
+          }
+        },
+        {
+          "label": "Half",
+          "set": {
+            "gfx/texture_detail": "half"
+          }
+        }
+      ]
+    },
+    {
+      "id": "astc_bc",
+      "label": "Compact textures",
+      "help": "Stores textures without transparency in half the video memory, with some banding in smooth gradients. Applies at the next start.",
+      "group": "Video memory",
+      "defaults": {
+        "gfx/astc_bc": "auto"
+      },
+      "choices": [
+        {
+          "label": "Automatic (below 7 GB of video memory)",
+          "set": {
+            "gfx/astc_bc": "auto"
+          }
+        },
+        {
+          "label": "Off",
+          "set": {
+            "gfx/astc_bc": "off"
+          }
+        },
+        {
+          "label": "Compact",
+          "set": {
+            "gfx/astc_bc": "bc1"
+          }
+        }
+      ]
+    },
+    {
+      "id": "fps",
+      "label": "Gameplay frame rate",
+      "help": "The game runs at 30 on the console. At 60 and above dialogue text also types faster. 120 needs a fast CPU.",
+      "group": "Frame rate",
+      "defaults": {
+        "fefw/fps60": "0",
+        "fefw/fps120": "0",
+        "fefw/fps240": "0"
+      },
+      "choices": [
+        {
+          "label": "30 fps (as the console)",
+          "set": {
+            "fefw/fps60": "0",
+            "fefw/fps120": "0",
+            "fefw/fps240": "0"
+          }
+        },
+        {
+          "label": "60 fps",
+          "set": {
+            "fefw/fps60": "1",
+            "fefw/fps120": "0",
+            "fefw/fps240": "0"
+          }
+        },
+        {
+          "label": "120 fps",
+          "set": {
+            "fefw/fps60": "0",
+            "fefw/fps120": "1",
+            "fefw/fps240": "0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "frame_gen",
+      "label": "Frame generation",
+      "help": "One generated frame between real ones. Best with VSync off on a 120 Hz or faster display. Needs the vendor's files (see the README). Applies at the next start.",
+      "group": "Frame rate",
+      "defaults": {
+        "dlss/frame_gen": "0"
+      },
+      "choices": [
+        {
+          "label": "Off",
+          "set": {
+            "dlss/frame_gen": "0"
+          }
+        },
+        {
+          "label": "NVIDIA DLSS frame generation (RTX 40 or newer)",
+          "set": {
+            "dlss/frame_gen": "dlss"
+          }
+        },
+        {
+          "label": "AMD FSR 3 frame generation",
+          "set": {
+            "dlss/frame_gen": "fsr3"
+          }
+        }
+      ]
+    }
+  ]
+}
