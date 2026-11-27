@@ -267,7 +267,37 @@ int sched_host_priority(int hos_prio) {
     return THREAD_PRIORITY_LOWEST;
 }
 
+bool high_qos() {
+    static const bool v = config_get_bool("sched", "high_qos", false);
+    return v;
+}
+
+void sched_set_process_qos() {
+    static bool done = false;
+    if (done || !high_qos()) return;
+    done = true;
+    PROCESS_POWER_THROTTLING_STATE st = {};
+    st.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    st.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+#ifdef PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+    st.ControlMask |= PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+#endif
+    st.StateMask = 0;   // controlled and off: never throttled
+    if (SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &st, sizeof st))
+        NXLOG_I("sched", "[sched] high_qos: power throttling off for the process (game and render threads at full speed)");
+    else
+        NXLOG_W("sched", "[sched] high_qos: SetProcessInformation(ProcessPowerThrottling) failed, error %lu", static_cast<unsigned long>(GetLastError()));
+}
+
+void sched_background_memory(bool background) {
+    if (!high_qos()) return;
+    MEMORY_PRIORITY_INFORMATION mp = {};
+    mp.MemoryPriority = background ? MEMORY_PRIORITY_LOW : MEMORY_PRIORITY_NORMAL;
+    SetThreadInformation(GetCurrentThread(), ThreadMemoryPriority, &mp, sizeof mp);
+}
+
 void sched_set_process_priority(bool interactive) {
+    sched_set_process_qos();
     std::string v = config_get_str("sched", "priority_class", "auto");
     for (char& c : v) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     DWORD cls = 0;

@@ -22,6 +22,7 @@
 
 #include <nxrt/config.h>
 #include <nxrt/cpu_limit.h>
+#include <nxrt/kernel.h>
 #include <nxrt/log.h>
 #include <nxrt/memory.h>
 
@@ -127,6 +128,7 @@ void set_thread_eco(bool on) {
     st.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
     st.StateMask = on ? THREAD_POWER_THROTTLING_EXECUTION_SPEED : 0;
     SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &st, sizeof st);
+    nxrt::kernel::sched_background_memory(on);   // [sched] high_qos
 #else
     (void)on;
 #endif
