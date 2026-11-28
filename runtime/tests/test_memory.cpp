@@ -733,10 +733,28 @@ NXTEST(unmapped_accesses_find_the_base_register_of_the_faulting_instruction) {
         {{0xff, 0x50, 0x08}, -1},                      // call [rax+8]: refused
         {{0x8f, 0x00}, -1},                            // pop [rax]: refused
         {{0x62, 0xf2, 0x7d, 0x49, 0xa0, 0x04, 0x88}, -1},   // vpscatterdd: refused
+        {{0xc4, 0xe2, 0x69, 0x90, 0x04, 0x88}, -1},    // vpgatherdd xmm0, [rax+xmm1*4], xmm2: refused
+        {{0xd9, 0x28}, -1},                            // fldcw [rax]: refused
+        {{0xd9, 0x38}, 0},                             // fnstcw [rax]
     };
     for (const Case& t : cases) {
         std::vector<uint8_t> code = t.code;
         code.resize(16, 0x90);
         CHECK(mem::unmapped_base_register_for_test(code.data()) == t.base);
+    }
+    // Which redirects keep what the instruction left in the base register: only a load into it (and xchg / xadd, which load).
+    struct Keep { std::vector<uint8_t> code; bool keep; };
+    const Keep keeps[] = {
+        {{0x48, 0x8b, 0x40, 0x08}, true},          // mov rax, [rax+8]
+        {{0x48, 0x87, 0x00}, true},                // xchg [rax], rax
+        {{0x48, 0x89, 0x40, 0x08}, false},         // mov [rax+8], rax: rax is put back
+        {{0x88, 0x20}, false},                     // mov [rax], ah
+        {{0x48, 0x0f, 0xc3, 0x12}, false},         // movnti [rdx], rdx
+        {{0x48, 0x8b, 0x41, 0x08}, false},         // mov rax, [rcx+8]: base rcx not written
+    };
+    for (const Keep& t : keeps) {
+        std::vector<uint8_t> code = t.code;
+        code.resize(16, 0x90);
+        CHECK(mem::unmapped_keeps_base_for_test(code.data()) == t.keep);
     }
 }

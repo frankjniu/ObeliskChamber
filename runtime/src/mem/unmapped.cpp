@@ -168,6 +168,7 @@ Operand decode_operand(const uint8_t* ip) {
         else if (op == 0x3a || op == 0x3b || op == 0x38 || op == 0x39 || op == 0x84 || op == 0x85) { o.role = Role::kSrc; byte_op = !(op & 1); }  // cmp / test
         else if ((op == 0x80 || op == 0x81 || op == 0x83) && regf == 7) o.role = Role::kNone;   // cmp m, imm
         else if ((op == 0xf6 || op == 0xf7) && regf <= 1) o.role = Role::kNone;                 // test m, imm
+        else if ((op == 0xd9 && (regf == 4 || regf == 5)) || (op == 0xdd && regf == 4)) return o;   // fldenv / fldcw / frstor: zeros would set the host's FPU state
         else if (op >= 0xd8 && op <= 0xdf) o.role = Role::kNone;                                // x87 loads and stores
         else if (op == 0x88 || op == 0x89) { o.role = Role::kStore; o.writes = true; byte_op = op == 0x88; }   // mov m, r
         else if ((op == 0xc6 || op == 0xc7) && regf == 0) o.writes = true;                      // mov m, imm
@@ -196,7 +197,8 @@ Operand decode_operand(const uint8_t* ip) {
         else return o;
     } else if (map == 2) {
         if (opc >= 0xf0) return o;   // movbe / crc32 / BMI: general registers
-        if (opc >= 0xa0 && opc <= 0xa3) return o;   // scatters: their lanes can land anywhere
+        if ((opc >= 0x90 && opc <= 0x93) || (opc >= 0xa0 && opc <= 0xa3)) return o;   // gathers / scatters: their lanes move with the base
+        if (opc == 0x49 || opc == 0x4b) return o;   // AMX tile loads / stores: rows strided far from the base
         o.role = Role::kNone;
     } else if (map == 3) {
         if (opc == 0xf0 || (opc >= 0x60 && opc <= 0x63)) return o;   // rorx; pcmp[ei]str[im] use rax/rcx/rdx
@@ -229,6 +231,10 @@ Operand decode_operand(const uint8_t* ip) {
     return o;
 }
 
+// The instruction replaces the base register with what it read (a load into it, xchg / xadd): keep that. A register only stored
+// (kStore with reg == base) is the moved pointer's old value: it must be put back like any other.
+bool keeps_base(const Operand& o) { return o.role == Role::kDest && o.reg == o.base; }
+
 DWORD64* context_register(CONTEXT* c, int r) {
     switch (r) {
     case 0: return &c->Rax; case 1: return &c->Rcx; case 2: return &c->Rdx; case 3: return &c->Rbx;
@@ -239,7 +245,7 @@ DWORD64* context_register(CONTEXT* c, int r) {
     }
 }
 
-// Per guest thread, made at its first redirect: 128 KiB of zeros, accesses are pointed at its middle. After each redirected
+// Per guest thread, made at its first redirect (top down, away from the low addresses): 128 KiB of zeros, accesses are pointed at its middle. After each redirected
 // instruction the bytes around the middle are zeroed again (a write is dropped), so every read through it sees 0; being the thread's
 // own, no other thread's write can show through. Kept for the thread's life (a thread that exits leaves its 128 KiB behind).
 thread_local uint8_t* t_sink = nullptr;
@@ -314,13 +320,14 @@ LONG redirect(EXCEPTION_POINTERS* ep, uint64_t addr, bool write) {
     DWORD64* r = o.base >= 0 ? context_register(c, o.base) : nullptr;
     if (!r) return EXCEPTION_CONTINUE_SEARCH;
     if (!t_sink) {
-        t_sink = static_cast<uint8_t*>(VirtualAlloc(nullptr, 2 * kSinkHalf, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        // top down: away from the low addresses broken mod offsets point at (and the guest might map)
+        t_sink = static_cast<uint8_t*>(VirtualAlloc(nullptr, 2 * kSinkHalf, MEM_RESERVE | MEM_COMMIT | MEM_TOP_DOWN, PAGE_READWRITE));
         if (!t_sink) return EXCEPTION_CONTINUE_SEARCH;
     }
     const uint64_t target = reinterpret_cast<uint64_t>(t_sink) + kSinkHalf;
     t_redirect.active = true;
     t_redirect.reg = o.base;
-    t_redirect.keep = o.reg == o.base;   // only kDest gets here with reg == base
+    t_redirect.keep = keeps_base(o);
     t_redirect.orig = *r;
     t_redirect.rip = rip;
     *r = *r + (target - addr);   // the operand's address becomes the block's middle (± the access width)
@@ -451,6 +458,7 @@ void log_thread() {
 }  // namespace
 
 int unmapped_base_register_for_test(const uint8_t* code) { return decode_operand(code).base; }
+bool unmapped_keeps_base_for_test(const uint8_t* code) { const Operand o = decode_operand(code); return o.base >= 0 && keeps_base(o); }
 
 void unmapped_install() {
     static std::atomic<bool> done{false};
