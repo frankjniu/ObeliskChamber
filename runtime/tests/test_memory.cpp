@@ -708,6 +708,11 @@ NXTEST(unmapped_reads_find_the_base_register_of_the_faulting_load) {
         {{0x66, 0x0f, 0x38, 0x00, 0x01}, 1},           // pshufb xmm0, [rcx]
         {{0xc4, 0xe2, 0xf9, 0xf7, 0x01}, -1},          // shlx rax, [rcx], rax (BMI): refused
         {{0x48, 0x01, 0x01}, -1},                      // add [rcx], rax (a read-modify-write): refused
+        {{0xc5, 0x7a, 0x2c, 0x00}, 0},                 // vcvttss2si r8d, [rax]: VEX.R makes the destination r8, not rax: allowed
+        {{0xc4, 0x41, 0x7a, 0x2c, 0x00}, 8},           // vcvttss2si r8d, [r8]: the load replaces the base: allowed
+        {{0xc4, 0x41, 0x7a, 0x2c, 0x40, 0x08}, 8},     // vcvttss2si r8d, [r8+8]
+        {{0x0f, 0x2c, 0x00}, -1},                      // cvttps2pi mm0, [rax] (MMX destination): refused
+        {{0x66, 0x0f, 0x3a, 0x63, 0x01, 0x00}, -1},    // pcmpistri xmm0, [rcx], 0 (writes ecx): refused
     };
     for (const Case& t : cases) {
         std::vector<uint8_t> code = t.code;

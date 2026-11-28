@@ -118,12 +118,14 @@ Operand decode_operand(const uint8_t* ip) {
     if (op == 0xc5) {
         vex = true;
         map = 1;
+        rex_r = !((ip[i + 1] >> 7) & 1);
         const uint8_t pp = ip[i + 1] & 3;
         p66 = pp == 1; pf3 = pp == 2; pf2 = pp == 3;
         opc = ip[i + 2];
         i += 3;
     } else if (op == 0xc4 || op == 0x62) {
         vex = true;
+        rex_r = !((ip[i + 1] >> 7) & 1);
         rex_b = !((ip[i + 1] >> 5) & 1);
         rex_x = !((ip[i + 1] >> 6) & 1);
         map = ip[i + 1] & (op == 0x62 ? 0x07 : 0x1f);
@@ -164,23 +166,22 @@ Operand decode_operand(const uint8_t* ip) {
     } else if (!vex && map == 1) {
         if (opc == 0xb6 || opc == 0xb7 || opc == 0xbe || opc == 0xbf) o.role = p16 ? Role::kDestPartial : Role::kDest;
         else if ((opc >= 0x40 && opc <= 0x4f) || opc == 0xaf || opc == 0xbc || opc == 0xbd || (opc == 0xb8 && pf3)) o.role = Role::kSrcDest;
-        else if ((opc == 0x2c || opc == 0x2d) && !p66) o.role = Role::kDest;   // cvt(t)ss/sd2si r, m
+        else if ((opc == 0x2c || opc == 0x2d) && (pf2 || pf3)) o.role = Role::kDest;   // cvt(t)ss/sd2si r, m (no prefix: to MMX)
         else if (vector_op_map1(opc, p66, pf3)) o.role = Role::kNone;
         else return o;
     } else if (map == 1) {   // VEX / EVEX map 1
-        if (opc == 0x2c || opc == 0x2d) o.role = Role::kDest;
+        if ((opc == 0x2c || opc == 0x2d) && (pf2 || pf3)) o.role = Role::kDest;
         else if (vector_op_map1(opc, p66, pf3)) o.role = Role::kNone;
         else return o;
     } else if (map == 2) {
         if (opc >= 0xf0) return o;   // movbe / crc32 / BMI: general registers
         o.role = Role::kNone;
     } else if (map == 3) {
-        if (opc == 0xf0 || (opc >= 0x14 && opc <= 0x17) || opc == 0x1d) return o;   // rorx; extracts store
+        if (opc == 0xf0 || (opc >= 0x14 && opc <= 0x17) || opc == 0x1d || (opc >= 0x60 && opc <= 0x63)) return o;   // rorx; extracts store; pcmp[ei]str[im] use rax/rcx/rdx
         o.role = Role::kNone;
     } else {
         return o;
     }
-    (void)pf2;
     if (o.role != Role::kNone) {
         o.reg = reg;
         if (byte_op && !rex && regf >= 4) o.reg = regf - 4;   // ah / ch / dh / bh: a byte of rax..rbx
@@ -228,9 +229,26 @@ bool in_lifted_code(uint64_t rip) {
     if (const RUNTIME_FUNCTION* f = RtlLookupFunctionEntry(rip, &image, nullptr))
         return std::binary_search(v->begin(), v->end(), image + f->BeginAddress);
     // No unwind entry: a leaf function (no frame, no saved registers). Accept it when the nearest lifted function at or below
-    // the instruction starts close by: a function with an unwind entry in between would have been found above.
+    // the instruction starts close by AND no other function's unwind entry starts between that lifted start and the instruction
+    // (otherwise the leaf may be someone else's, such as a CRT helper without unwind data placed after it).
     auto it = std::upper_bound(v->begin(), v->end(), rip);
-    return it != v->begin() && rip - *(it - 1) < 0x4000;
+    if (it == v->begin() || rip - *(it - 1) >= 0x4000) return false;
+    const uint64_t lifted = *(it - 1);
+    void* base = nullptr;
+    if (!RtlPcToFileHeader(reinterpret_cast<void*>(rip), &base) || !base) return false;
+    const auto* dos = static_cast<const IMAGE_DOS_HEADER*>(base);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(static_cast<const uint8_t*>(base) + dos->e_lfanew);
+    const IMAGE_DATA_DIRECTORY& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+    const auto* fns = reinterpret_cast<const RUNTIME_FUNCTION*>(static_cast<const uint8_t*>(base) + dir.VirtualAddress);
+    size_t lo = 0, hi = dir.Size / sizeof(RUNTIME_FUNCTION);   // sorted by BeginAddress: the last entry starting at or below rip
+    const uint64_t rva = rip - reinterpret_cast<uint64_t>(base);
+    while (lo < hi) {
+        const size_t mid = (lo + hi) / 2;
+        if (fns[mid].BeginAddress <= rva) lo = mid + 1; else hi = mid;
+    }
+    if (lo == 0) return true;
+    const uint64_t last = reinterpret_cast<uint64_t>(base) + fns[lo - 1].BeginAddress;
+    return last <= lifted;   // the last function with unwind data before the instruction is the lifted one or earlier
 }
 
 struct Redirect {
@@ -359,16 +377,24 @@ void log_entry(const Entry& e) {
 
 void log_thread() {
     int logged = 0, logged_redirects = 0;
-    size_t lifted_for = 0;
+    uint64_t lifted_for = 0, last_count = ~uint64_t(0);
+    const std::vector<uint64_t>* retired = nullptr;
     bool full_said = false;
     for (int tick = 0;; ++tick) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         // Lifted functions registered since the last snapshot (modules load at boot, mods can add replacements): publish a new
         // sorted list of their host addresses for in_lifted_code. Old lists are kept (a reader may hold one); they are few.
-        if (const size_t n = fn_count(); n != lifted_for) {
-            g_lifted.store(new std::vector<uint64_t>(host_function_starts()), std::memory_order_release);
+        // Rebuilt once the registrations have held still for a tick (modules register thousands at boot); the generation also
+        // changes when a mod replaces a function at an existing address. The list from two rebuilds ago is freed: a reader holds
+        // one only for the length of one fault, and rebuilds are at least 100 ms apart.
+        const uint64_t n = fn_generation();
+        if (n != lifted_for && n == last_count) {
+            const std::vector<uint64_t>* old = g_lifted.exchange(new std::vector<uint64_t>(host_function_starts()), std::memory_order_acq_rel);
+            delete retired;
+            retired = old;
             lifted_for = n;
         }
+        last_count = n;
         if (tick % 5) continue;   // log every 500 ms
         const int n = std::min(g_used.load(std::memory_order_relaxed), kMaxGranules);
         while (logged < n && g_entries[logged].ready.load(std::memory_order_acquire)) {
