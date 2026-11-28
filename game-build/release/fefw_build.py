@@ -549,7 +549,7 @@ def pchtxt_bytes(val, little):
     if not hx or len(hx) % 2 or any(c not in '0123456789abcdefABCDEF' for c in hx):
         return None
     b = bytes.fromhex(hx)
-    return b[::-1] if little else b
+    return b   # written as typed: @little-endian / @big-endian change nothing, as on Eden (common/hex_util.cpp), Ryujinx and EmblemWeave
 
 
 def parse_pchtxt(text, where, build_id):

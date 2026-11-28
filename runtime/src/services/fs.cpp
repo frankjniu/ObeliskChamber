@@ -528,13 +528,28 @@ std::shared_ptr<fs::RomfsImage> rom_image() {
     const std::string dir = romfs_dir();
     std::vector<std::string> overlays;
     const auto record = exefs_record();
+    std::vector<std::pair<std::string, std::string>> romfs_mods;   // (name, host folder)
     for (const RomfsMod& m : installed_mods()) {
         if (m.has_exefs && has_exefs_patches(m)) log_exefs_patches(m, record);
         if (!m.romfs.empty()) {
             NXLOG_I("mods", "%s: RomFS from %s", m.name.c_str(), m.romfs.c_str());
-            overlays.push_back(m.romfs);
+            romfs_mods.emplace_back(m.name, m.romfs);
         }
     }
+    // [fs] mod_priority: which mod's file is used when two mods have the same path. first (default): as Eden and the yuzu family
+    // (file_sys/patch_manager.cpp: mod folders sorted by name bytes, the first layer that has the file wins), so a pack tested
+    // there gets the same files. last: the mod sorted last (ignoring case) wins, as before. Overlays are laid over each other in
+    // order with the later replacing, so for first they are laid in reverse byte order.
+    const std::string prio = config_get_str("fs", "mod_priority", "first");
+    if (prio != "last") {
+        if (prio != "first") NXLOG_W("mods", "[fs] mod_priority = %s: not first or last, first is used", prio.c_str());
+        std::sort(romfs_mods.begin(), romfs_mods.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
+    }
+    if (romfs_mods.size() > 1)
+        NXLOG_I("mods", "RomFS mods: where two have the same file, the %s ([fs] mod_priority = %s)",
+                prio == "last" ? "one sorted last (ignoring case) wins" : "one sorted first (by name bytes) wins, as on Eden",
+                prio == "last" ? "last" : "first");
+    for (const auto& m : romfs_mods) overlays.push_back(m.second);
     // code mods' file edits (nxrt/mod_api.h edit_file): applied to the tree with the RomFS mods laid over it
     fs::RomfsEdits edits;
     edits.wants = &modapi::file_edit_wanted;

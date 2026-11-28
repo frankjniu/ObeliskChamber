@@ -273,5 +273,13 @@ class ModSites(unittest.TestCase):
         self.assertEqual([n for n, _ in fb.find_mod_dirs(os.path.join(self.game, 'mods'))], ['on'])
 
 
+class PchtxtBytes(unittest.TestCase):
+    def test_little_endian_writes_bytes_as_typed(self):
+        """@little-endian is the usual header of a pchtxt; Eden, Ryujinx and EmblemWeave write the bytes as typed either way."""
+        self.assertEqual(fb.pchtxt_bytes('1F2003D5', True), bytes.fromhex('1F2003D5'))
+        self.assertEqual(fb.pchtxt_bytes('1F2003D5', False), bytes.fromhex('1F2003D5'))
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=1)
+
