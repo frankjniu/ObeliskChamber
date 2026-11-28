@@ -1995,6 +1995,13 @@ float tex_scale_wanted(Texture* t) {
     return attachment_scale(*t);
 }
 
+// The create flags for an image made again (tex_rescale, tex_demote): the flags it was made with, so an sRGB image with storage usage
+// keeps VK_IMAGE_CREATE_EXTENDED_USAGE_BIT (without it that image is invalid, the #243 crash class); base_flags for images whose flags were
+// not recorded (sparse). tex_move already uses create_flags.
+static VkImageCreateFlags remake_flags(const TexGpu& g, const Shape& s) {
+    return g.create_known ? g.create_flags : base_flags(s, g.format);
+}
+
 // Remakes the image at another scale (Ryujinx scales a texture when it becomes a render target and blacklists one that cannot be
 // scaled). The content is blitted over when the format allows it (otherwise it starts undefined). Going to 1 is for good. The old image
 // and its views are destroyed after the frames that use them.
@@ -2009,7 +2016,7 @@ bool tex_rescale(Texture* t, Frame& f, float to, const char* why) {
     }
     gfx::Image ni;
     std::string err;
-    if (device().create_image(make_desc(s, g->format, g->usage, base_flags(s, g->format)), &ni, &err) != VK_SUCCESS) {
+    if (device().create_image(make_desc(s, g->format, g->usage, remake_flags(*g, s)), &ni, &err) != VK_SUCCESS) {
         NXLOG_W(kTag, "texture %u: cannot remake it at %ux%u (%s): it keeps scale %.3f", t->id, s.base.width, s.base.height, err.c_str(), g->scale);
         if (to == 1.0f) g->scale_blocked = true;
         return false;
@@ -2126,7 +2133,7 @@ uint64_t tex_demote(Texture* t, TexGpu* g, Frame& f) {
     ns.layers = g->layers;
     gfx::Image ni;
     std::string err;
-    gfx::ImageDesc nd = make_desc(ns, g->format, g->usage, base_flags(s, g->format));
+    gfx::ImageDesc nd = make_desc(ns, g->format, g->usage, remake_flags(*g, s));
     nd.small_pool = true;   // not in the room the whole images leave: their blocks can empty and go back to the OS
     if (device().create_image(nd, &ni, &err) != VK_SUCCESS) return 0;
     move_layout(f, *g, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
@@ -2866,8 +2873,12 @@ void tex_residency_restore(Frame& f) {
 
 void tex_poll_cpu_writes() {
     if (!g_tex_ww) return;
+    // [nvn] tex_poll_scan_all (default false): the whole heap's written bitmap is scanned only when a watched page was written since the
+    // last poll (take_written_if_any); true scans it at every submission as before, for the A/B.
+    static const bool scan_all = config_get_bool("nvn", "tex_poll_scan_all", false);
     g_tex_ww_pages.clear();
-    mem::ww::take_written(g_tex_ww, g_tex_ww_pages);
+    if (scan_all) mem::ww::take_written(g_tex_ww, g_tex_ww_pages);
+    else mem::ww::take_written_if_any(g_tex_ww, g_tex_ww_pages);
     if (g_tex_ww_pages.empty()) return;
     std::sort(g_tex_ww_pages.begin(), g_tex_ww_pages.end());
     const uint64_t base = mem::ww::region_base(g_tex_ww);

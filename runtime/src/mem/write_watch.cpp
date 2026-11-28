@@ -1038,6 +1038,7 @@ void forget(uint64_t addr, uint64_t size, bool ban) {
             if (test(r->prot.get(), q)) release_page(r, q);
         set_bits(r->valid.get(), first, count, false);
         set_bits(r->written.get(), first, count, true);
+        r->any_written.store(true, std::memory_order_release);   // after the bits, as release_page: take_written_if_any must see them
     });
 }
 
