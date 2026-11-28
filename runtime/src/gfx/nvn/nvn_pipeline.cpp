@@ -283,7 +283,7 @@ PipelineCacheOrigin pipeline_cache_peek() {
 }
 // The write at the end of a session: skipped when the cache is the big one of a preparation and little was added.
 void pipeline_cache_flush() {
-    if (!g_cache_big || g_new_since_save.load(std::memory_order_relaxed) >= 300) save_cache();
+    if (g_cache_dirty.load(std::memory_order_relaxed) && (!g_cache_big || g_new_since_save.load(std::memory_order_relaxed) >= 300)) save_cache();
 }
 
 bool GraphicsKey::operator==(const GraphicsKey& o) const { return std::memcmp(this, &o, sizeof *this) == 0; }
@@ -2193,7 +2193,8 @@ void pipeline_shutdown() {
         g_comp_jobs.clear();
         g_comp_stats = CompStats{};
     }
-    if (!g_cache_big || g_new_since_save.load() >= 300) save_cache();
+    // nothing new since the last save (the saver thread, a pipeline build): the file on disk is the cache already
+    if (g_cache_dirty.load() && (!g_cache_big || g_new_since_save.load() >= 300)) save_cache();
     for (auto& [h, bucket] : g_gfx)
         for (auto& e : bucket) {
             if (e.second) vkDestroyPipeline(d, e.second, nullptr);
