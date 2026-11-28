@@ -12,9 +12,12 @@
 // How: a vectored exception handler, registered last (the write tracker and the heap's lazy commit answer their own faults first).
 // For an access violation on a guest thread, at an address below 4 GiB whose 64 KiB granule is free both in the process (VirtualQuery:
 // MEM_FREE) and in the guest's memory map (svcQueryMemory: free), it maps that granule as zeroed memory and lets the instruction run
-// again: reads see 0. A write gets a writable granule (the console would fault, the emulators drop it; here later reads of the same
-// address see what was written: a difference only for code that reads back what it wrote to nowhere). Nothing the game or the runtime
-// maps lives below 4 GiB (code at 0x7100000000, the heap and stacks higher), and the granules are given back if the guest maps there.
+// again: reads see 0. The granule is read-only, so the zeros stay: a write there, or a write to a free granule, is dropped as on
+// the emulators (by the one-instruction redirect below; a write from code that is not the lifted game's gets a writable granule and
+// stays). At start the free granules of the low [memory] unmapped_reserve_mb (64 MiB) are reserved, so that no host allocation made
+// later sits where a mod's stale offset points (the game would read the host's bytes where the emulators read 0). Nothing the game or
+// the runtime maps lives below 4 GiB (code at 0x7100000000, the heap and stacks higher), and the granules are given back if the
+// guest maps there.
 // Each new granule is logged once (from a logging thread, not the handler), with the guest function that read it; at most 4096
 // granules (256 MiB of address space), then faults crash as before. [memory] unmapped_access = crash: the old behaviour.
 //
@@ -40,6 +43,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <thread>
 
 #include "nxrt/config.h"
@@ -373,6 +377,18 @@ void abandon_redirect(EXCEPTION_POINTERS* ep) {
     wipe_sink();
 }
 
+// Granules below 4 GiB that are ours (kept back at start, or mapped as zeros here): one bit each.
+std::atomic<uint64_t> g_mine[kHigh / kGranule / 64];
+bool is_mine(uint64_t granule) {
+    const uint64_t i = granule / kGranule;
+    return i < kHigh / kGranule && (g_mine[i / 64].load(std::memory_order_relaxed) >> (i % 64) & 1);
+}
+void set_mine(uint64_t granule, bool on) {
+    const uint64_t i = granule / kGranule, bit = uint64_t(1) << (i % 64);
+    if (on) g_mine[i / 64].fetch_or(bit, std::memory_order_relaxed);
+    else g_mine[i / 64].fetch_and(~bit, std::memory_order_relaxed);
+}
+
 LONG CALLBACK on_fault(EXCEPTION_POINTERS* ep) {
     const EXCEPTION_RECORD* er = ep->ExceptionRecord;
     if (!g_on.load(std::memory_order_relaxed)) return EXCEPTION_CONTINUE_SEARCH;
@@ -386,12 +402,31 @@ LONG CALLBACK on_fault(EXCEPTION_POINTERS* ep) {
     const uint64_t granule = addr & ~(kGranule - 1);
     MEMORY_BASIC_INFORMATION mbi{};
     if (!VirtualQuery(reinterpret_cast<void*>(granule), &mbi, sizeof mbi)) return EXCEPTION_CONTINUE_SEARCH;
-    if (mbi.State != MEM_FREE || reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize < granule + kGranule)
-        return redirect(ep, addr, kind == 1);   // not wholly free (a host reservation): can't map either
+    const bool reserved = mbi.State == MEM_RESERVE && is_mine(granule);   // kept back at start, nothing committed yet
+    const bool free = mbi.State == MEM_FREE && reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize >= granule + kGranule;
+    if (!reserved && !free) {
+        // committed: a zero granule of ours (a write to it: dropped, as on the emulators) or memory of the host's (a reservation)
+        const LONG r = redirect(ep, addr, kind == 1);
+        DWORD old = 0;
+        if (r == EXCEPTION_CONTINUE_SEARCH && kind == 1 && is_mine(granule) &&
+            VirtualProtect(reinterpret_cast<void*>(granule), kGranule, PAGE_READWRITE, &old))
+            return EXCEPTION_CONTINUE_EXECUTION;   // not lifted code (a native routine): the write stays, as before
+        return r;
+    }
     if (vm_query(granule).state != kMemFree) return EXCEPTION_CONTINUE_SEARCH;
+    if (kind == 1) {   // a write is dropped (the instruction is pointed at scratch zeros); nothing is mapped for it
+        const LONG r = redirect(ep, addr, true);
+        if (r != EXCEPTION_CONTINUE_SEARCH) return r;
+    }
     const int slot = g_used.fetch_add(1, std::memory_order_relaxed);
     if (slot >= kMaxGranules) return EXCEPTION_CONTINUE_SEARCH;
-    if (!VirtualAlloc(reinterpret_cast<void*>(granule), kGranule, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)) {
+    // reads see zeros that stay zeros: read-only, so a later write is dropped too. A write that could not be redirected (not the
+    // lifted code) gets a writable granule and stays there.
+    const DWORD prot = kind == 1 ? PAGE_READWRITE : PAGE_READONLY;
+    void* got = reserved ? VirtualAlloc(reinterpret_cast<void*>(granule), kGranule, MEM_COMMIT, prot)
+                         : VirtualAlloc(reinterpret_cast<void*>(granule), kGranule, MEM_RESERVE | MEM_COMMIT, prot);
+    if (got) set_mine(granule, true);
+    if (!got) {
         g_entries[slot].skip = true;   // the slot is taken: mark it so the logger does not wait on it for ever
         g_entries[slot].ready.store(true, std::memory_order_release);
         // another thread mapped it first (both faulted on the same granule): the access can run again if it is ours now
@@ -469,6 +504,32 @@ void unmapped_install() {
         NXLOG_I(kTag, "unmapped guest accesses crash ([memory] unmapped_access = crash)");
         return;
     }
+    // [memory] unmapped_reserve_mb: keep the free granules of the low addresses back (reserved, no access), so that no host
+    // allocation made later lands where a mod's stale offset points: the game would read the host's bytes there, where the
+    // emulators read 0 (a mod's raw file offsets are a few MB). Reserved, they fault like free memory and are answered the same.
+    const int64_t mb = std::clamp<int64_t>(config_get_int("memory", "unmapped_reserve_mb", 64), 0, 3072);
+    int kept = 0, taken = 0;
+    std::string taken_at;
+    for (uint64_t g = kLow; g < kLow + uint64_t(mb) * 0x100000; g += kGranule) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery(reinterpret_cast<void*>(g), &mbi, sizeof mbi)) break;
+        if (mbi.State == MEM_FREE && reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize >= g + kGranule &&
+            VirtualAlloc(reinterpret_cast<void*>(g), kGranule, MEM_RESERVE, PAGE_NOACCESS)) {
+            set_mine(g, true);
+            ++kept;
+        } else {
+            if (taken < 8) {
+                char b[32];
+                std::snprintf(b, sizeof b, "%s0x%llx", taken ? ", " : "", static_cast<unsigned long long>(g));
+                taken_at += b;
+            }
+            ++taken;
+        }
+    }
+    if (mb > 0)
+        NXLOG_I(kTag, "unmapped guest accesses: %d of the 64 KiB granules below %lld MiB kept free of host memory, %d already the host's%s%s%s "
+                "([memory] unmapped_reserve_mb)", kept, static_cast<long long>(mb) + 1, taken, taken ? " (" : "", taken_at.c_str(),
+                taken > 8 ? ", ...)" : taken ? ")" : "");
     g_veh = AddVectoredExceptionHandler(0, on_fault);
     if (!g_veh) {
         NXLOG_W(kTag, "unmapped guest accesses: no exception handler: they crash");
@@ -481,7 +542,15 @@ void unmapped_install() {
 
 // A fixed reservation (reserve_fixed) that overlaps granules mapped here takes them back first.
 void unmapped_release(uint64_t addr, uint64_t size) {
-    if (addr >= kHigh || g_used.load(std::memory_order_relaxed) == 0) return;
+    if (addr >= kHigh) return;
+    // granules kept back at start and not mapped since: give the reservation back
+    for (uint64_t g = std::max(addr & ~(kGranule - 1), kLow); g < std::min(addr + size, kHigh); g += kGranule) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (is_mine(g) && VirtualQuery(reinterpret_cast<void*>(g), &mbi, sizeof mbi) && mbi.State == MEM_RESERVE &&
+            VirtualFree(reinterpret_cast<void*>(g), 0, MEM_RELEASE))
+            set_mine(g, false);
+    }
+    if (g_used.load(std::memory_order_relaxed) == 0) return;
     const int n = std::min(g_used.load(std::memory_order_relaxed), kMaxGranules);
     for (int i = 0; i < n; ++i) {
         uint64_t g = g_entries[i].granule.load(std::memory_order_relaxed);
@@ -489,6 +558,7 @@ void unmapped_release(uint64_t addr, uint64_t size) {
         if (g && g < addr + size && g + kGranule > addr && g_entries[i].granule.compare_exchange_strong(g, 0)) {
             g = was;
             VirtualFree(reinterpret_cast<void*>(g), 0, MEM_RELEASE);
+            set_mine(g, false);
             NXLOG_I(kTag, "unmapped accesses: the zeroed granule at 0x%llx given back (the guest maps there)", static_cast<unsigned long long>(g));
         }
     }
