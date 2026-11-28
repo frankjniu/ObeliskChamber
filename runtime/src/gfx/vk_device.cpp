@@ -1037,7 +1037,7 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
         vkGetPhysicalDeviceQueueFamilyProperties(physical_, &nfam, fams.data());
         if (queue_family_ < nfam) fg_queues = extras::ffx_fg_extra_queues(fams[queue_family_].queueCount);
     }
-    // [gfx] async_compute (auto: on when the graphics family has a queue to spare, not on Intel): one more queue of the family for background
+    // [gfx] async_compute (default off; auto: on when the graphics family has a queue to spare, not on Intel): one more queue of the family for background
     // GPU work, at a lower priority than the frame's (the ASTC transcodes after a load, nvn_astc_gpu.cpp). Same family: buffers and images
     // need no ownership transfer between the two.
     uint32_t async_index = 0;
@@ -1046,9 +1046,9 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
         vkGetPhysicalDeviceQueueFamilyProperties(physical_, &nfam, nullptr);
         std::vector<VkQueueFamilyProperties> fams(nfam);
         vkGetPhysicalDeviceQueueFamilyProperties(physical_, &nfam, fams.data());
-        std::string ac = config_get_str("gfx", "async_compute", "auto");
+        std::string ac = config_get_str("gfx", "async_compute", "off");
         std::transform(ac.begin(), ac.end(), ac.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        if (ac.empty()) ac = "auto";   // set but empty (an ini line with no value, or the A/B harness clearing the variable): the default
+        if (ac.empty()) ac = "off";    // set but empty (an ini line with no value, or the A/B harness clearing the variable): the default
         const bool want = ac == "on" || ac == "true" || ac == "1" || (ac == "auto" && props_.vendorID != 0x8086);
         if (want && queue_family_ < nfam) {
             if (fams[queue_family_].queueCount > 1 + fg_queues) async_index = 1 + fg_queues;
