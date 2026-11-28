@@ -218,17 +218,19 @@ uint8_t* g_zero = nullptr;   // 128 KiB read-only zeros; loads are pointed at it
 constexpr uint64_t kZeroHalf = 0x10000;
 
 // Lifted code only: the function containing the faulting instruction (its unwind entry) must start at a registered lifted
-// function. The snapshot of their host addresses is rebuilt by the log thread whenever more are registered.
+// function (a leaf with no unwind entry: a lifted function must start within 16 KiB below it). The snapshot of their host addresses is rebuilt by the log thread whenever more are registered.
 std::atomic<const std::vector<uint64_t>*> g_lifted{nullptr};
 
 bool in_lifted_code(uint64_t rip) {
     const std::vector<uint64_t>* v = g_lifted.load(std::memory_order_acquire);
     if (!v || v->empty()) return false;
     DWORD64 image = 0;
-    const RUNTIME_FUNCTION* f = RtlLookupFunctionEntry(rip, &image, nullptr);
-    if (!f) return false;
-    const uint64_t start = image + f->BeginAddress;
-    return std::binary_search(v->begin(), v->end(), start);
+    if (const RUNTIME_FUNCTION* f = RtlLookupFunctionEntry(rip, &image, nullptr))
+        return std::binary_search(v->begin(), v->end(), image + f->BeginAddress);
+    // No unwind entry: a leaf function (no frame, no saved registers). Accept it when the nearest lifted function at or below
+    // the instruction starts close by: a function with an unwind entry in between would have been found above.
+    auto it = std::upper_bound(v->begin(), v->end(), rip);
+    return it != v->begin() && rip - *(it - 1) < 0x4000;
 }
 
 struct Redirect {
