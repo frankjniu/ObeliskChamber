@@ -418,6 +418,8 @@ bool repath(Node& n, const std::string& parent, std::string& msg) {
     return true;
 }
 
+thread_local uint32_t t_clashes = 0;   // files found in two RomFS mods in the layout being built (make_layout resets and reports it)
+
 void mark_from_mod(Node& n) {
     n.from_mod = !n.is_dir;
     for (Node& k : n.kids) mark_from_mod(k);
@@ -437,8 +439,7 @@ bool merge(Node& base, Node& add, uint32_t& taken, std::string& msg) {
         } else if (it->is_dir && k.is_dir) {
             if (!merge(*it, k, taken, msg)) return false;
         } else if (!it->is_dir && !k.is_dir) {
-            static int clashes = 0;   // one line per file for the first 50, then one with the count at the end (make_layout)
-            if (it->from_mod && ++clashes <= 50) {
+            if (it->from_mod && ++t_clashes <= 50) {   // one line per file for the first 50, the count at the end (make_layout)
                 std::string from;
                 if (!to_utf8(k.host, from)) from = "?";
                 NXLOG_I("mods", "romfs: %s is in two mods: %s is used ([fs] mod_priority)", it->path.c_str(), from.c_str());
@@ -550,6 +551,7 @@ bool make_layout(const std::string& host_dir, const std::vector<std::string>& ov
         return false;
     }
     uint32_t taken = 0;
+    t_clashes = 0;
     std::vector<std::wstring> overlay_hosts;   // the applied overlays' folders, parallel to L.overlay_names
     for (const std::string& o : overlays) {
         std::wstring wo;
@@ -752,6 +754,7 @@ bool make_layout(const std::string& host_dir, const std::vector<std::string>& ov
     L.stats.data_bytes = data_bytes;
     L.stats.data_offset = kPartitionOfs;
     L.stats.overlay_files = taken;
+    if (t_clashes > 50) NXLOG_I("mods", "romfs: %u files in all are in two mods (the first 50 are named above)", t_clashes);
     L.stats.edited_files = edited;
     L.built = true;
     return true;
