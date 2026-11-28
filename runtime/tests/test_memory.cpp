@@ -674,3 +674,87 @@ NXTEST(heap_protect_cycle_is_fast_with_full_heap) {
     CHECK_MSG(ms < 2000, "50 protect cycles on a 256 MiB committed heap took " + std::to_string(ms) + " ms");
     mem::shutdown();
 }
+
+
+// [memory] unmapped_access points a lifted read of the null page area (or of a host reservation) at a zero block for one instruction:
+// the decoder must find the operand's base register, and refuse what it can't redirect.
+NXTEST(unmapped_accesses_find_the_base_register_of_the_faulting_instruction) {
+    struct Case { std::vector<uint8_t> code; int base; };
+    const Case cases[] = {
+        {{0x48, 0x8b, 0x41, 0x08}, 1},                 // mov rax, [rcx+8]
+        {{0x41, 0x0f, 0xb6, 0x01}, 9},                 // movzx eax, byte [r9]
+        {{0xc5, 0xf8, 0x10, 0x42, 0x10}, 2},           // vmovups xmm0, [rdx+0x10]
+        {{0xc4, 0xc1, 0x7e, 0x6f, 0x00}, 8},           // vmovdqu ymm0, [r8]
+        {{0x48, 0x8b, 0x04, 0xc8}, 0},                 // mov rax, [rax+rcx*8]
+        {{0x41, 0x80, 0x7d, 0x00, 0x00}, 13},          // cmp byte [r13+0], 0
+        {{0x66, 0x0f, 0x6f, 0x46, 0x20}, 6},           // movdqa xmm0, [rsi+0x20]
+        {{0x48, 0x8b, 0x05, 0, 0, 0, 0}, -1},          // mov rax, [rip+0]: refused
+        {{0x48, 0x8b, 0x04, 0x25, 8, 0, 0, 0}, -1},    // mov rax, [8] (no base): refused
+        {{0x48, 0x8b, 0x04, 0x00}, -1},                // mov rax, [rax+rax]: refused
+        {{0x65, 0x48, 0x8b, 0x00}, -1},                // mov rax, gs:[rax]: refused
+        {{0x48, 0x89, 0xc8}, -1},                      // mov rax, rcx (no memory operand): refused
+        {{0x48, 0x8b, 0x40, 0x08}, 0},                 // mov rax, [rax+8]: the load replaces the base: allowed
+        {{0x48, 0x3b, 0x00}, -1},                      // cmp rax, [rax]: the base read as a value: refused
+        {{0x48, 0x03, 0x40, 0x08}, -1},                // add rax, [rax+8]: refused
+        {{0x8a, 0x40, 0x08}, -1},                      // mov al, [rax+8]: a partial write of the base: refused
+        {{0x8a, 0x61, 0x08}, 1},                       // mov ah, [rcx+8]: ah is part of rax, not of the base rcx: allowed
+        {{0x8a, 0x60, 0x08}, -1},                      // mov ah, [rax+8]: a partial write of the base: refused
+        {{0x41, 0x8b, 0x04, 0x24}, 12},                // mov eax, [r12]
+        {{0x41, 0x8b, 0x45, 0x00}, 13},                // mov eax, [r13+0]
+        {{0x41, 0x8b, 0x04, 0x25, 8, 0, 0, 0}, -1},    // SIB base 5, mod 0, REX.B: no base: refused
+        {{0x4a, 0x8b, 0x04, 0xc0}, 0},                 // mov rax, [rax+r8*8]
+        {{0x66, 0x41, 0x0f, 0x6f, 0x00}, 8},           // movdqa xmm0, [r8]
+        {{0x62, 0xf1, 0x7c, 0x48, 0x10, 0x02}, 2},     // vmovups zmm0, [rdx]
+        {{0x66, 0x0f, 0x38, 0x00, 0x01}, 1},           // pshufb xmm0, [rcx]
+        {{0xc4, 0xe2, 0xf9, 0xf7, 0x01}, -1},          // shlx rax, [rcx], rax (BMI): refused
+        {{0xc5, 0x7a, 0x2c, 0x00}, 0},                 // vcvttss2si r8d, [rax]: VEX.R makes the destination r8, not rax: allowed
+        {{0xc4, 0x41, 0x7a, 0x2c, 0x00}, 8},           // vcvttss2si r8d, [r8]: the load replaces the base: allowed
+        {{0xc4, 0x41, 0x7a, 0x2c, 0x40, 0x08}, 8},     // vcvttss2si r8d, [r8+8]
+        {{0x0f, 0x2c, 0x00}, -1},                      // cvttps2pi mm0, [rax] (MMX destination): refused
+        {{0x66, 0x0f, 0x3a, 0x63, 0x01, 0x00}, -1},    // pcmpistri xmm0, [rcx], 0 (writes ecx): refused
+        {{0x48, 0x89, 0x48, 0x18}, 0},                 // mov [rax+0x18], rcx: a store, dropped
+        {{0x48, 0x89, 0x40, 0x18}, 0},                 // mov [rax+0x18], rax: the stored value doesn't matter: allowed
+        {{0x48, 0xc7, 0x40, 0x18, 1, 0, 0, 0}, 0},     // mov qword [rax+0x18], 1
+        {{0xc6, 0x41, 0x08, 0x01}, 1},                 // mov byte [rcx+8], 1
+        {{0x48, 0x01, 0x01}, 1},                       // add [rcx], rax: a read-modify-write, dropped
+        {{0x48, 0x01, 0x00}, -1},                      // add [rax], rax: the base read as a value: refused
+        {{0xf0, 0xff, 0x40, 0x08}, 0},                 // lock inc dword [rax+8]
+        {{0xf0, 0x48, 0x0f, 0xc1, 0x08}, 0},           // lock xadd [rax], rcx: rcx gets the old 0
+        {{0xf0, 0x48, 0x0f, 0xb1, 0x0a}, 2},           // lock cmpxchg [rdx], rcx
+        {{0xf0, 0x48, 0x0f, 0xb1, 0x08}, -1},          // lock cmpxchg [rax], rcx: rax is used implicitly: refused
+        {{0xf0, 0x48, 0x8b, 0x00}, -1},                // lock on a load: refused
+        {{0xd3, 0x21}, -1},                            // shl dword [rcx], cl: refused
+        {{0xd3, 0x20}, 0},                             // shl dword [rax], cl
+        {{0x0f, 0x94, 0x40, 0x08}, 0},                 // sete [rax+8]
+        {{0xc5, 0xf8, 0x11, 0x40, 0x10}, 0},           // vmovups [rax+0x10], xmm0
+        {{0x66, 0x0f, 0xd6, 0x47, 0x08}, 7},           // movq [rdi+8], xmm0
+        {{0x48, 0x87, 0x01}, 1},                       // xchg [rcx], rax: rax gets the 0
+        {{0x48, 0x87, 0x00}, 0},                       // xchg [rax], rax: the register gets the 0, kept
+        {{0xff, 0x50, 0x08}, -1},                      // call [rax+8]: refused
+        {{0x8f, 0x00}, -1},                            // pop [rax]: refused
+        {{0x62, 0xf2, 0x7d, 0x49, 0xa0, 0x04, 0x88}, -1},   // vpscatterdd: refused
+        {{0xc4, 0xe2, 0x69, 0x90, 0x04, 0x88}, -1},    // vpgatherdd xmm0, [rax+xmm1*4], xmm2: refused
+        {{0xd9, 0x28}, -1},                            // fldcw [rax]: refused
+        {{0xd9, 0x38}, 0},                             // fnstcw [rax]
+    };
+    for (const Case& t : cases) {
+        std::vector<uint8_t> code = t.code;
+        code.resize(16, 0x90);
+        CHECK(mem::unmapped_base_register_for_test(code.data()) == t.base);
+    }
+    // Which redirects keep what the instruction left in the base register: only a load into it (and xchg / xadd, which load).
+    struct Keep { std::vector<uint8_t> code; bool keep; };
+    const Keep keeps[] = {
+        {{0x48, 0x8b, 0x40, 0x08}, true},          // mov rax, [rax+8]
+        {{0x48, 0x87, 0x00}, true},                // xchg [rax], rax
+        {{0x48, 0x89, 0x40, 0x08}, false},         // mov [rax+8], rax: rax is put back
+        {{0x88, 0x20}, false},                     // mov [rax], ah
+        {{0x48, 0x0f, 0xc3, 0x12}, false},         // movnti [rdx], rdx
+        {{0x48, 0x8b, 0x41, 0x08}, false},         // mov rax, [rcx+8]: base rcx not written
+    };
+    for (const Keep& t : keeps) {
+        std::vector<uint8_t> code = t.code;
+        code.resize(16, 0x90);
+        CHECK(mem::unmapped_keeps_base_for_test(code.data()) == t.keep);
+    }
+}

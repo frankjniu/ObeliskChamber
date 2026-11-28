@@ -691,14 +691,40 @@ NX_INLINE V128 v_dd(uint64_t lo, uint64_t hi) { V128 v; v.d[0] = lo; v.d[1] = hi
 // x0 unchanged = the destination; memcmp / strcmp: the difference of the first differing bytes as unsigned chars, written as a W
 // register, 0 when equal; strlen: the length). Registers the guest routine clobbers (x1..x18, v0..v7, NZCV) are left as they
 // are: no caller reads them after the call (AAPCS64). The guest memcpy (__memcpy_aarch64) is overlap-safe like memmove.
-NX_INLINE void hle_memmove(Ctx *c) { std::memmove(reinterpret_cast<void *>(c->x[0]), reinterpret_cast<const void *>(c->x[1]), c->x[2]); }
-NX_INLINE void hle_memset(Ctx *c) { std::memset(reinterpret_cast<void *>(c->x[0]), static_cast<int>(static_cast<uint8_t>(c->x[1])), c->x[2]); }
-NX_INLINE void hle_strlen(Ctx *c) { c->x[0] = std::strlen(reinterpret_cast<const char *>(c->x[0])); }
+// A pointer into the first 64 KiB (where nothing is ever mapped: a null pointer, or a broken mod reference read as 0 and used as a
+// pointer) is answered as the yuzu-family emulators answer the guest routine's own accesses there: reads see zeros, writes are
+// dropped. The native routines would fault in the host's C library, where the runtime's unmapped-read handler does not answer.
+NX_INLINE bool hle_null_area(uint64_t p) { return __builtin_expect(p < 0x10000, 0); }
+NX_INLINE void hle_memmove(Ctx *c) {
+    if (hle_null_area(c->x[0]) || hle_null_area(c->x[1])) [[unlikely]] {
+        if (c->x[2] && !hle_null_area(c->x[0])) std::memset(reinterpret_cast<void *>(c->x[0]), 0, c->x[2]);   // from zeros
+        return;
+    }
+    std::memmove(reinterpret_cast<void *>(c->x[0]), reinterpret_cast<const void *>(c->x[1]), c->x[2]);
+}
+NX_INLINE void hle_memset(Ctx *c) {
+    if (hle_null_area(c->x[0])) [[unlikely]] return;
+    std::memset(reinterpret_cast<void *>(c->x[0]), static_cast<int>(static_cast<uint8_t>(c->x[1])), c->x[2]);
+}
+NX_INLINE void hle_strlen(Ctx *c) {
+    if (hle_null_area(c->x[0])) [[unlikely]] { c->x[0] = 0; return; }
+    c->x[0] = std::strlen(reinterpret_cast<const char *>(c->x[0]));
+}
 NX_INLINE uint32_t hle_bytediff(uint64_t x, uint64_t y) {   // first differing byte (lowest address = lowest byte) of two unequal words
     const unsigned s = static_cast<unsigned>(__builtin_ctzll(x ^ y)) & ~7u;
     return static_cast<uint32_t>((x >> s) & 0xff) - static_cast<uint32_t>((y >> s) & 0xff);
 }
 NX_INLINE void hle_memcmp(Ctx *c) {
+    if ((hle_null_area(c->x[0]) || hle_null_area(c->x[1])) && c->x[2]) [[unlikely]] {   // one side reads as zeros
+        const uint8_t *a = reinterpret_cast<const uint8_t *>(c->x[0]), *b = reinterpret_cast<const uint8_t *>(c->x[1]);
+        const bool za = hle_null_area(c->x[0]), zb = hle_null_area(c->x[1]);
+        for (uint64_t i = 0; i < c->x[2]; i++) {
+            const uint32_t x = za ? 0u : a[i], y = zb ? 0u : b[i];
+            if (x != y) { c->x[0] = x - y; return; }
+        }
+        c->x[0] = 0;
+        return;
+    }
     const uint8_t *a = reinterpret_cast<const uint8_t *>(c->x[0]), *b = reinterpret_cast<const uint8_t *>(c->x[1]);
     uint64_t n = c->x[2], i = 0;
     uint32_t r = 0;
@@ -713,7 +739,9 @@ NX_INLINE void hle_memcmp(Ctx *c) {
     c->x[0] = r;
 }
 NX_INLINE void hle_strcmp(Ctx *c) {
-    const uint8_t *a = reinterpret_cast<const uint8_t *>(c->x[0]), *b = reinterpret_cast<const uint8_t *>(c->x[1]);
+    static const uint8_t kEmpty = 0;
+    const uint8_t *a = hle_null_area(c->x[0]) ? &kEmpty : reinterpret_cast<const uint8_t *>(c->x[0]);   // reads as an empty string
+    const uint8_t *b = hle_null_area(c->x[1]) ? &kEmpty : reinterpret_cast<const uint8_t *>(c->x[1]);
     for (;; a++, b++)
         if (*a != *b || !*a) { c->x[0] = static_cast<uint32_t>(*a) - static_cast<uint32_t>(*b); return; }
 }

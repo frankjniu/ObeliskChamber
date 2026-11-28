@@ -59,7 +59,7 @@ std::vector<AddOnContent> installed_aoc();
 // common.cpp: RomFS mods under [fs] mods (default "mods"), the layout emulators use, so mods made for them work as they are: any folder
 // below it (up to 4 levels) holding romfs/ or exefs/ is a mod ("mods/<name>/romfs", "mods/contents/<title id>/<name>/romfs"). A folder
 // whose name starts with '-', '_' or '.' is off, and so is a folder named by another title's id. Sorted by their path below the mods
-// folder, ignoring case: when two mods have the same file, the one sorted last wins (01-..., 02-...). exefs/ (code patches) is not
+// folder, ignoring case; when two mods have the same file, [fs] mod_priority decides (fs.cpp rom_image: by default the first by name bytes, as on Eden). exefs/ (code patches) is not
 // applied, since the code is compiled ahead of time; such mods are reported with has_exefs (exefs/*.dll code mods are loaded by
 // mods_dll.cpp instead, nxrt/mod_api.h). The layout and rules follow Hookshot
 // host/mods.c (NotRexed/Hookshot, GPL-3.0-or-later; from SkyboundTotk's loader), so a mods folder works the same in both.

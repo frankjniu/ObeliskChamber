@@ -203,6 +203,23 @@ void fn_clear() {
     g_byhost = {};
 }
 
+uint64_t fn_generation() {
+    return (uint64_t(g_fn_epoch.load(std::memory_order_acquire)) << 40) ^ g_fn_count.load(std::memory_order_acquire);
+}
+
+std::vector<uint64_t> host_function_starts() {
+    {
+        std::lock_guard<std::mutex> lk(g_byhost_lock);
+        g_byhost.built_for = ~decltype(g_byhost.built_for)(0);   // rebuild: replacements at an existing address do not change the count
+    }
+    guest_function_of(0);   // (re)builds g_byhost for the functions registered so far
+    std::lock_guard<std::mutex> lk(g_byhost_lock);
+    std::vector<uint64_t> out;
+    out.reserve(g_byhost.v.size());
+    for (const auto& e : g_byhost.v) out.push_back(e.first);
+    return out;
+}
+
 uint64_t guest_function_of(uint64_t host_rip) {
     std::lock_guard<std::mutex> lk(g_byhost_lock);
     size_t n = g_fn_count.load(std::memory_order_relaxed);

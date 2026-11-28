@@ -119,6 +119,7 @@ struct Node {
     uint32_t first_file = kNone;   // directories: first file entry
     uint64_t data = 0;           // files: offset of the data from the partition start
     std::shared_ptr<const std::vector<uint8_t>> mem;   // files: the content after an edit (RomfsEdits), served instead of the host file
+    bool from_mod = false;       // files: taken from a RomFS mod (merge), to name the clash when a second mod has it too
 };
 
 std::string shown(const Node& n) { return n.path.empty() ? std::string("/") : n.path; }
@@ -417,6 +418,13 @@ bool repath(Node& n, const std::string& parent, std::string& msg) {
     return true;
 }
 
+thread_local uint32_t t_clashes = 0;   // files found in two RomFS mods in the layout being built (make_layout resets and reports it)
+
+void mark_from_mod(Node& n) {
+    n.from_mod = !n.is_dir;
+    for (Node& k : n.kids) mark_from_mod(k);
+}
+
 // Lays the overlay directory `add` over `base`. `taken` counts the files taken from the overlay.
 bool merge(Node& base, Node& add, uint32_t& taken, std::string& msg) {
     for (Node& k : add.kids) {
@@ -425,12 +433,19 @@ bool merge(Node& base, Node& add, uint32_t& taken, std::string& msg) {
             it = std::find_if(base.kids.begin(), base.kids.end(), [&](const Node& b) { return same_name_nocase(b.name, k.name); });
         if (it == base.kids.end()) {
             if (!repath(k, base.path, msg)) return false;
+            mark_from_mod(k);
             taken += count_files(k);
             base.kids.push_back(std::move(k));
         } else if (it->is_dir && k.is_dir) {
             if (!merge(*it, k, taken, msg)) return false;
         } else if (!it->is_dir && !k.is_dir) {
+            if (it->from_mod && ++t_clashes <= 50) {   // one line per file for the first 50, the count at the end (make_layout)
+                std::string from;
+                if (!to_utf8(k.host, from)) from = "?";
+                NXLOG_I("mods", "romfs: %s is in two mods: %s is used ([fs] mod_priority)", it->path.c_str(), from.c_str());
+            }
             it->host = k.host;
+            it->from_mod = true;
             it->size = k.size;
             it->src = 0;
             taken++;
@@ -438,6 +453,7 @@ bool merge(Node& base, Node& add, uint32_t& taken, std::string& msg) {
             // a file where the game has a folder, or the other way round: the overlay's entry replaces the game's
             const std::string name = it->name;
             *it = std::move(k);
+            mark_from_mod(*it);
             it->name = name;
             if (!repath(*it, base.path, msg)) return false;
             taken += count_files(*it);
@@ -535,6 +551,7 @@ bool make_layout(const std::string& host_dir, const std::vector<std::string>& ov
         return false;
     }
     uint32_t taken = 0;
+    t_clashes = 0;
     std::vector<std::wstring> overlay_hosts;   // the applied overlays' folders, parallel to L.overlay_names
     for (const std::string& o : overlays) {
         std::wstring wo;
@@ -737,6 +754,7 @@ bool make_layout(const std::string& host_dir, const std::vector<std::string>& ov
     L.stats.data_bytes = data_bytes;
     L.stats.data_offset = kPartitionOfs;
     L.stats.overlay_files = taken;
+    if (t_clashes > 50) NXLOG_I("mods", "romfs: %u files in all are in two mods (the first 50 are named above)", t_clashes);
     L.stats.edited_files = edited;
     L.built = true;
     return true;

@@ -58,6 +58,8 @@ bool is_mapped(uint64_t addr, uint64_t size);                // every byte of th
 // that overlap a range about to be reserved.
 void unmapped_install();
 void unmapped_release(uint64_t addr, uint64_t size);
+int unmapped_base_register_for_test(const uint8_t* code);
+bool unmapped_keeps_base_for_test(const uint8_t* code);   // the redirect keeps what the instruction wrote to the base register   // the memory operand's base register (0..15), -1 if it can't be moved
 
 // ---- heap section ---------------------------------------------------------------------------------------------------
 // One pagefile-backed section (SEC_RESERVE, nothing is charged until committed) with a primary view at kHeapBase. Under Wine
