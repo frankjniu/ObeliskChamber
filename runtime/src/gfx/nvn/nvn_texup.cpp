@@ -22,6 +22,7 @@
 
 #include <nxrt/config.h>
 #include <nxrt/cpu_limit.h>
+#include <nxrt/kernel.h>
 #include <nxrt/log.h>
 #include <nxrt/memory.h>
 
@@ -120,6 +121,7 @@ void first_pass_end() { g_first_pass.fetch_sub(1, std::memory_order_relaxed); }
 
 void set_thread_eco(bool on) {
 #ifdef _WIN32
+    nxrt::kernel::sched_background_memory(on);   // [sched] high_qos, whatever texture_eco says
     static const bool eco = config_get_bool("gfx", "texture_eco", true);
     if (!eco) return;
     THREAD_POWER_THROTTLING_STATE st = {};

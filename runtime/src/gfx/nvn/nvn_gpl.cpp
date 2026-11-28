@@ -17,6 +17,8 @@
 // part and teaches the prediction (the flags are added to the set that later programs get ahead).
 //
 // Pipelines whose exact key is in the key file are built whole by the prewarm (nvn_prewarm.cpp) and never reach this file.
+#include "nxrt/kernel.h"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -364,6 +366,7 @@ void boost_thread(void* handle) {
     st.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
     st.StateMask = 0;                                    // explicitly not throttled
     SetThreadInformation(h, ThreadPowerThrottling, &st, sizeof st);
+    nxrt::kernel::sched_background_memory(false, h);     // [sched] high_qos: a draw waits on it, normal memory priority
 }
 void* self_handle() { return t_self.get(); }
 #else
@@ -737,6 +740,7 @@ void set_compile_thread_priority(bool background) {
     if (mode == "normal") p = THREAD_PRIORITY_NORMAL;
     else if (mode == "idle") p = THREAD_PRIORITY_IDLE;
     SetThreadPriority(GetCurrentThread(), p);
+    nxrt::kernel::sched_background_memory(background);   // [sched] high_qos: low memory priority while it builds in the background
     // Efficiency mode (EcoQoS): Windows runs the thread on the efficiency cores of a hybrid CPU and at a lower clock elsewhere, so a burst of
     // shader compiles does not take the fast cores from the game's own threads. Not for the shader preparation, which wants all the speed.
     // [nvn] compile_eco: auto (default) = on only for a hybrid CPU; true / false force it.

@@ -179,6 +179,14 @@ int sched_current_core();
 // background CPU load a woken thread waits a full scheduler quantum for its processor (debug 180, S10 measurements: 100 to 200 ms
 // stalls and half the frame rate with every core busy); a class above the background keeps the hand-overs immediate.
 void sched_set_process_priority(bool interactive);
+// [sched] high_qos (default false): Windows' power throttling (EcoQoS) is turned off for the whole process, so neither a laptop on battery
+// nor a hybrid CPU's scheduler runs the game's or the render thread at a lower clock or on the efficiency cores, and the process's timer
+// resolution request is kept while its window is hidden. Threads that set their own state (the background compile and texture threads in
+// efficiency mode, [nvn] compile_eco / [gfx] texture_eco) keep it. Called once by sched_set_process_priority.
+void sched_set_process_qos();
+// [sched] high_qos: a background worker's memory priority. `background` = low (Windows takes its pages off the standby list first under
+// memory pressure), false = normal again. Nothing without the switch.
+void sched_background_memory(bool background, void* thread = nullptr);   // thread: a HANDLE (null: the calling thread)
 void sched_apply(KThread& t);            // (re)applies affinity + priority of t to its host thread
 std::string sync_wait_report();          // the guest threads blocked in WaitForAddress / process-wide keys / mutex hand-overs, with the word each waits on (watchdog dump; never blocks)
 void yield_host();                       // the calling thread offers its processor to another ready thread (SwitchToThread), unless the starvation guard aged it
