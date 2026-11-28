@@ -92,6 +92,35 @@ struct ShaderPrepareResult {
 };
 bool prepare_shaders(const ShaderPrepareOptions& o, ShaderPrepareResult* r);
 
+// Pipeline build before play (S1): builds every pipeline of the player's own key file ([nvn] pipeline_keys, recorded by earlier sessions)
+// into the pipeline cache ([nvn] pipeline_cache) on many threads, each destroyed as soon as it exists, then writes the cache. No game code
+// runs: the pipelines are made from the shader cache's stand-in shaders, as the boot prewarm makes them (nvn_prewarm.cpp). Keys already built
+// for this GPU, driver build and [nvn] spirv_salt (the list <pipeline_keys>.built) are skipped unless `force`, so a second run with nothing
+// new costs only the device start. Needs the back end installed (`register_entry_points = false` is enough), an open shader cache, and the
+// boot prewarm not running in this process.
+struct PipelineBuildResult;
+struct PipelineBuildOptions {
+    int threads = 0;                                              // 0: all hardware threads but two (at least one)
+    bool force = false;                                           // build every key, also those the list says are in the cache
+    std::function<bool(uint64_t done, uint64_t total)> progress;  // called about every 100 ms from the calling thread; returning false stops
+    std::function<void(const PipelineBuildResult& at)> started;   // once, when there is work: keys, todo, threads, gpu and identity are filled
+};
+struct PipelineBuildResult {
+    uint64_t keys = 0;              // in the key file
+    uint64_t todo = 0;              // not yet built for this GPU and driver (all of them with force)
+    uint64_t built = 0, failed = 0; // of todo
+    uint64_t missing_shaders = 0;   // of failed: a stage has no translated shader in the cache (an older Set up's key)
+    double seconds = 0;             // building, without the device start and the cache load
+    double median_ms = 0;           // build time of one pipeline (median): under ~2.5 ms the driver had it already
+    int threads = 0;
+    bool cancelled = false;
+    bool already_ready = false;     // nothing to do (todo == 0)
+    std::string identity;           // "<vendor>:<device>:<pipeline cache UUID> driver=<driverVersion> salt=<[nvn] spirv_salt>"
+    std::string gpu;                // the device name
+    std::string error;              // why nothing could be done
+};
+bool build_pipelines(const PipelineBuildOptions& o, PipelineBuildResult* r);   // false: nothing could be done (see r->error)
+
 struct BackendStats {
     uint64_t submits = 0, lists_replayed = 0, draws = 0, draws_skipped = 0, dispatches = 0, clears = 0, copies = 0, presents = 0;
     uint64_t passes = 0, pass_breaks = 0, pipelines_created = 0, pipeline_cache_hits = 0, descriptor_sets = 0;

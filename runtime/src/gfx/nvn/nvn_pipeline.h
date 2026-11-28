@@ -136,6 +136,9 @@ void pipeline_cache_flush();
 enum class PipelineCacheOrigin { none, loaded, stale, unreadable };
 PipelineCacheOrigin pipeline_cache_open();          // opens the cache now if no build did yet
 std::string pipeline_cache_identity();              // "vendor:device:uuid" of this GPU and driver build
+// What pipeline_cache_open would find, from the file's header alone (32 bytes read; the cache is not created). For the pipeline build
+// (S1), which decides from it whether anything needs building before it reads a cache of hundreds of MB.
+PipelineCacheOrigin pipeline_cache_peek();
 
 // ---- prewarm (nvn_prewarm.cpp) ----------------------------------------------------------------------------------------------
 // Every pipeline that had to be created at a draw is recorded in a key file ([nvn] pipeline_keys). The next run compiles the recorded
@@ -161,6 +164,9 @@ struct PrewarmStats {
     double wait_ms = 0;
 };
 PrewarmStats prewarm_stats();
+// The pipeline build before play (nxrt::nvn::build_pipelines, S1): every key of the key file into the pipeline cache, on many threads, with
+// no game running. Refused while the prewarm of this process is running (prewarm_init was called and not shut down).
+bool prewarm_build_all(const nxrt::nvn::PipelineBuildOptions& o, nxrt::nvn::PipelineBuildResult* r);
 // `ints`: samplers that read integer textures (spirv_int_samplers); null when that variant cannot be made (the caller then uses the
 // translated module with float views).
 VkPipeline compute_pipeline(const ShaderInfo* cs, const ProgLayout& layout, const std::vector<SpvIntSampler>& ints = {});
