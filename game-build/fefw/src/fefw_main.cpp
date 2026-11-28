@@ -482,6 +482,10 @@ int fefw_run(int argc, char** argv) {
         else if (arg("--status")) boot_opts.emplace_back("build_pipelines_status", argv[++i]);
         else { std::fprintf(stderr, "fefw: unknown argument %s\n", argv[i]); return 2; }
     }
+    // --build-pipelines logs to its own file (--log, else pipeline_build.log), so ObeliskChamber.log keeps the last play session: the
+    // ini's [log] path would win over --log, the environment wins over both
+    for (const auto& kv : boot_opts)
+        if (kv.first == "build_pipelines" && !std::getenv("NXRT_LOG")) _putenv_s("NXRT_LOG", logp ? logp : "pipeline_build.log");
     if (!ini && !std::getenv("NXRT_INI")) adopt_old_ini(nxrt::game::info().game_ini);
     if (!ini && !std::getenv("NXRT_INI") && file_exists(nxrt::game::info().game_ini)) ini = nxrt::game::info().game_ini;
 

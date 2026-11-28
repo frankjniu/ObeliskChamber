@@ -233,6 +233,7 @@ pub fn start(
         let _ = std::fs::remove_file(&stop_path);
         let mut cmd = play::game_command(&exe, &dir, &launcher_dir, &runner);
         cmd.args(["--build-pipelines", "--status", STATUS_FILE, "--log", LOG_FILE]);
+        cmd.env("NXRT_LOG", LOG_FILE); // ObeliskChamber.ini's [log] path would win over --log: the environment wins over it
         if force {
             cmd.arg("--force");
         }
