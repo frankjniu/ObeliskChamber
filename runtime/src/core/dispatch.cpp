@@ -203,6 +203,15 @@ void fn_clear() {
     g_byhost = {};
 }
 
+std::vector<uint64_t> host_function_starts() {
+    guest_function_of(0);   // (re)builds g_byhost for the functions registered so far
+    std::lock_guard<std::mutex> lk(g_byhost_lock);
+    std::vector<uint64_t> out;
+    out.reserve(g_byhost.v.size());
+    for (const auto& e : g_byhost.v) out.push_back(e.first);
+    return out;
+}
+
 uint64_t guest_function_of(uint64_t host_rip) {
     std::lock_guard<std::mutex> lk(g_byhost_lock);
     size_t n = g_fn_count.load(std::memory_order_relaxed);

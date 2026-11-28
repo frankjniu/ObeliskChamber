@@ -693,6 +693,21 @@ NXTEST(unmapped_reads_find_the_base_register_of_the_faulting_load) {
         {{0x48, 0x8b, 0x04, 0x00}, -1},                // mov rax, [rax+rax]: refused
         {{0x65, 0x48, 0x8b, 0x00}, -1},                // mov rax, gs:[rax]: refused
         {{0x48, 0x89, 0xc8}, -1},                      // mov rax, rcx (no memory operand): refused
+        {{0x48, 0x8b, 0x40, 0x08}, 0},                 // mov rax, [rax+8]: the load replaces the base: allowed
+        {{0x48, 0x3b, 0x00}, -1},                      // cmp rax, [rax]: the base read as a value: refused
+        {{0x48, 0x03, 0x40, 0x08}, -1},                // add rax, [rax+8]: refused
+        {{0x8a, 0x40, 0x08}, -1},                      // mov al, [rax+8]: a partial write of the base: refused
+        {{0x8a, 0x61, 0x08}, 1},                       // mov ah, [rcx+8]: ah is part of rax, not of the base rcx: allowed
+        {{0x8a, 0x60, 0x08}, -1},                      // mov ah, [rax+8]: a partial write of the base: refused
+        {{0x41, 0x8b, 0x04, 0x24}, 12},                // mov eax, [r12]
+        {{0x41, 0x8b, 0x45, 0x00}, 13},                // mov eax, [r13+0]
+        {{0x41, 0x8b, 0x04, 0x25, 8, 0, 0, 0}, -1},    // SIB base 5, mod 0, REX.B: no base: refused
+        {{0x4a, 0x8b, 0x04, 0xc0}, 0},                 // mov rax, [rax+r8*8]
+        {{0x66, 0x41, 0x0f, 0x6f, 0x00}, 8},           // movdqa xmm0, [r8]
+        {{0x62, 0xf1, 0x7c, 0x48, 0x10, 0x02}, 2},     // vmovups zmm0, [rdx]
+        {{0x66, 0x0f, 0x38, 0x00, 0x01}, 1},           // pshufb xmm0, [rcx]
+        {{0xc4, 0xe2, 0xf9, 0xf7, 0x01}, -1},          // shlx rax, [rcx], rax (BMI): refused
+        {{0x48, 0x01, 0x01}, -1},                      // add [rcx], rax (a read-modify-write): refused
     };
     for (const Case& t : cases) {
         std::vector<uint8_t> code = t.code;
