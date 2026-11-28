@@ -67,6 +67,19 @@ export function statusText(s) {
   if (x) return t('play.lostTrack', { error: x[1] });
   x = /^ObeliskChamber\.exe exited with code (-?\d+) \(0x([0-9A-Fa-f]+)\)\.$/.exec(m);
   if (x) return t('play.exitedCode', { code: x[1], hex: x[2].toUpperCase() });
+  // the pipeline build before play (pipelines.rs)
+  if (m === 'Building pipelines...') return t('play.buildStarting');
+  if (m === 'Stopping the pipeline build...') return t('play.buildStopping');
+  if (m === 'Pipelines are already built for this GPU and driver.') return t('play.buildReady');
+  if (m === 'The pipeline build stopped; what was built is kept.') return t('play.buildStopped');
+  x = /^Building pipelines: (\d+) of (\d+)$/.exec(m);
+  if (x) return t('play.buildProgress', { done: x[1], total: x[2] });
+  x = /^Pipelines built: (\d+) in (\d+) s\.$/.exec(m);
+  if (x) return t('play.buildDone', { built: x[1], seconds: x[2] });
+  x = /^Pipelines built: (\d+) in (\d+) s \((\d+) could not be built\)\.$/.exec(m);
+  if (x) return t('play.buildDoneFailed', { built: x[1], seconds: x[2], failed: x[3] });
+  x = /^The pipeline build failed: (.*)$/.exec(m);
+  if (x) return t('play.buildFailed', { error: x[1] });
   return m;
 }
 
