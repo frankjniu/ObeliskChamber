@@ -49,6 +49,8 @@
 
 #include "nxrt/config.h"
 #include "nxrt/cpu_limit.h"
+#include "nxrt/diag.h"
+#include "nxrt/runtime.h"
 #include "nxrt/ftrace.h"
 #include "nxrt/gauge.h"
 #include "nxrt/log.h"
@@ -169,13 +171,19 @@ void save_rewarm_locked() {
     g_rw_dirty = false;
 }
 
-// The cache file was just written: what was built into the cache until then is in it.
-void rewarm_note_saved_locked() {
-    // before the rewarm thread has read the list and set the identity, the list is not written: it would go out with no identity and be
-    // thrown away as "another driver" when the thread reads it (the pending keys wait for the next save)
-    if (!g_rewarm_on || g_rw_pending.empty() || g_rw_identity.empty()) return;
-    for (uint64_t d : g_rw_pending) g_rw_done.insert(d);
-    g_rw_pending.clear();
+// The cache file was just written with the keys in `taken` (taken out of g_rw_pending before the write): they are listed. A write that
+// failed, or one before the rewarm thread has read the list and set the identity (the list would go out with no identity and be thrown
+// away as "another driver"), puts them back in front of what was built meanwhile, for the next save. Taking them out before the write
+// (not counting an index into g_rw_pending) keeps two saves that overlap (the saver and a rewarm thread) from listing unsaved keys.
+void rewarm_note_saved_locked(std::vector<uint64_t>& taken, bool saved) {
+    if (taken.empty()) return;
+    if (!saved || !g_rewarm_on || g_rw_identity.empty()) {
+        g_rw_pending.insert(g_rw_pending.begin(), taken.begin(), taken.end());
+        taken.clear();
+        return;
+    }
+    for (uint64_t d : taken) g_rw_done.insert(d);
+    taken.clear();
     save_rewarm_locked();
 }
 
@@ -191,6 +199,25 @@ bool rewarm_from_config(size_t deferred) {
     for (char& c : v) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     if (v == "auto" || v.empty()) return deferred > 0;
     return !(v == "false" || v == "0" || v == "off" || v == "no");
+}
+
+// [nvn] cache_rewarm_threads: 1 (default, before S1), a number (1 to 16), or auto = a quarter of the hardware threads (1 to 8), the share
+// Fossilize-style background replays take. Read once.
+size_t rewarm_threads_from_config() {
+    static const size_t n = [] {
+        std::string v = config_get_str("nvn", "cache_rewarm_threads", "1");
+        for (char& c : v) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        const unsigned hw = std::max(1u, nxrt::host_threads());
+        if (v == "auto") return static_cast<size_t>(std::clamp<unsigned>(hw / 4, 1, 8));
+        char* end = nullptr;
+        const long long x = std::strtoll(v.c_str(), &end, 10);
+        if (v.empty() || end == v.c_str() || x < 1) {
+            if (!v.empty() && v != "1") NXLOG_W(kTag, "[nvn] cache_rewarm_threads = %s is not auto or a number from 1: 1 is used", v.c_str());
+            return static_cast<size_t>(1);
+        }
+        return static_cast<size_t>(std::min<long long>(x, 16));
+    }();
+    return n;
 }
 
 void load_seen() {
@@ -426,17 +453,15 @@ void worker_main() {
 
 // Writes the cache file now and lists what went into it (from the rewarm thread, which holds no lock here).
 void save_rewarm_progress() {
-    size_t pending;
+    std::vector<uint64_t> taken;
     {
         std::lock_guard<std::mutex> lk(g_mu);
-        pending = g_rw_pending.size();
+        taken.swap(g_rw_pending);
     }
-    if (!pending || !pipeline_cache_save()) return;
+    if (taken.empty()) return;
+    const bool saved = pipeline_cache_save();
     std::lock_guard<std::mutex> lk(g_mu);
-    std::vector<uint64_t> rest(g_rw_pending.begin() + static_cast<std::ptrdiff_t>(std::min(pending, g_rw_pending.size())), g_rw_pending.end());
-    g_rw_pending.resize(std::min(pending, g_rw_pending.size()));
-    rewarm_note_saved_locked();
-    g_rw_pending = std::move(rest);
+    rewarm_note_saved_locked(taken, saved);
 }
 
 // [nvn] cache_rewarm: once the boot queue is done, the keys left out of it go into the pipeline cache one by one (see the top of the file).
@@ -491,43 +516,70 @@ void rewarm_main() {
                 origin == PipelineCacheOrigin::loaded ? "loaded" : origin == PipelineCacheOrigin::stale ? "out of date" : origin == PipelineCacheOrigin::none ? "new" : "unreadable");
     }
     const auto t_start = std::chrono::steady_clock::now();
-    for (const auto& j : todo) {
-        {
-            std::lock_guard<std::mutex> lk(g_mu);
-            if (g_stop) return;
-            if (j->in_queue || j->state != 0) continue;            // the game set its program meanwhile: a prewarm worker has it
-        }
-        GraphicsKey k;
-        const ProgLayout* pl = nullptr;
-        VkPipeline p = VK_NULL_HANDLE;
-        const auto t0 = std::chrono::steady_clock::now();
-        if (stub_key(j->rec, k, pl)) {
-            NXFT("prewarm.rewarm");
-            p = build_graphics_pipeline(k, *pl);
-        }
-        const float ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        if (p) vkDestroyPipeline(vkdev(), p, nullptr);              // the cache keeps the code; the pipeline itself is not wanted yet
-        {
-            std::lock_guard<std::mutex> lk(g_mu);
-            if (p) {
-                ++g_rw.built;
-                g_rw.ms += ms;
-                if (g_rw.each.size() < 4096) g_rw.each.push_back(ms);
-                g_rw_pending.push_back(j->digest);
-            } else {
-                ++g_rw.failed;
+    // [nvn] cache_rewarm_threads (S1): the threads that share the list, all at the lowest priority and paced like this one. 1 (default):
+    // this thread alone, as before.
+    const size_t nthreads = std::min<size_t>(rewarm_threads_from_config(), std::max<size_t>(1, todo.size()));
+    std::atomic<size_t> next{0};
+    auto work = [&todo, &next] {
+        for (;;) {
+            const size_t i = next.fetch_add(1);
+            if (i >= todo.size()) return;
+            const auto& j = todo[i];
+            {
+                std::lock_guard<std::mutex> lk(g_mu);
+                if (g_stop) return;
+                if (j->in_queue || j->state != 0) continue;            // the game set its program meanwhile: a prewarm worker has it
             }
+            GraphicsKey k;
+            const ProgLayout* pl = nullptr;
+            VkPipeline p = VK_NULL_HANDLE;
+            const auto t0 = std::chrono::steady_clock::now();
+            if (stub_key(j->rec, k, pl)) {
+                NXFT("prewarm.rewarm");
+                p = build_graphics_pipeline(k, *pl);
+            }
+            const float ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            if (p) vkDestroyPipeline(vkdev(), p, nullptr);              // the cache keeps the code; the pipeline itself is not wanted yet
+            bool save_now = false;
+            {
+                std::lock_guard<std::mutex> lk(g_mu);
+                if (p) {
+                    ++g_rw.built;
+                    g_rw.ms += ms;
+                    if (g_rw.each.size() < 4096) g_rw.each.push_back(ms);
+                    g_rw_pending.push_back(j->digest);
+                    save_now = g_rw.built % 1000 == 0;   // a big cache file is otherwise rewritten only after 3,000 new pipelines
+                } else {
+                    ++g_rw.failed;
+                }
+            }
+            pace_shader_work();
+            if (save_now) save_rewarm_progress();
         }
-        pace_shader_work();
-        if (g_rw.built && g_rw.built % 1000 == 0) save_rewarm_progress();   // a big cache file is otherwise rewritten only after 3,000 new pipelines
+    };
+    std::vector<std::thread> helpers;
+    for (size_t t = 1; t < nthreads; ++t)
+        helpers.emplace_back([&work] {
+            log_set_thread_name("nvn-rewarm");
+            set_compile_thread_priority();
+#if defined(_WIN32)
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);
+#endif
+            work();
+        });
+    work();
+    for (auto& t : helpers) t.join();
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        if (g_stop) return;                                          // shutting down, as before: the next session goes on from the list
     }
     save_rewarm_progress();
     std::lock_guard<std::mutex> lk(g_mu);
     g_rw.finished = true;
     const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
     const float med = median_of(g_rw.each);
-    NXLOG_I(kTag, "cache rewarm: done, %llu keys built into the pipeline cache (%llu failed) in %.1f s, %.1f ms of building each (median, %s)",
-            static_cast<unsigned long long>(g_rw.built), static_cast<unsigned long long>(g_rw.failed), s, med,
+    NXLOG_I(kTag, "cache rewarm: done, %llu keys built into the pipeline cache (%llu failed) in %.1f s on %zu thread(s), %.1f ms of building each (median, %s)",
+            static_cast<unsigned long long>(g_rw.built), static_cast<unsigned long long>(g_rw.failed), s, nthreads, med,
             med < 2.5f ? "they were in the driver's cache" : "compiled from scratch");
 }
 
@@ -586,17 +638,12 @@ void saver_main() {
             if (g_seen_dirty) save_seen_locked();
         }
         if (pipeline_cache_dirty()) {
-            const size_t pending = g_rw_pending.size();
+            std::vector<uint64_t> taken;                 // only what was pending before the write is surely in the file
+            if (g_rewarm_on && !g_rw_identity.empty()) taken.swap(g_rw_pending);
             lk.unlock();
             const bool saved = pipeline_cache_save();
             lk.lock();
-            if (saved && pending) {
-                // only what was pending before the write is surely in the file
-                std::vector<uint64_t> rest(g_rw_pending.begin() + static_cast<std::ptrdiff_t>(pending), g_rw_pending.end());
-                g_rw_pending.resize(pending);
-                rewarm_note_saved_locked();
-                g_rw_pending = std::move(rest);
-            }
+            rewarm_note_saved_locked(taken, saved);
         } else if (g_rw_dirty && !g_rw_identity.empty()) {
             save_rewarm_locked();
         }
@@ -857,6 +904,331 @@ void prewarm_shutdown() {
 PrewarmStats prewarm_stats() {
     std::lock_guard<std::mutex> lk(g_mu);
     return g_stats;
+}
+
+// ---- the pipeline build before play (S1) ---------------------------------------------------------------------------------------
+// ObeliskChamber.exe --build-pipelines (nxrt::nvn::build_pipelines): with no game running, every recorded key is built into the pipeline
+// cache on all hardware threads but two, so the boot prewarm and the first visit to each place find the driver's work done instead of
+// competing with the game for the cores (RTX 3070 Laptop, 8 cores / 16 threads, 4,744 keys from a cold driver: ~83 s on 6 threads, ~41 s
+// on 14, no extra memory: claude/S1_Cold_Prewarm_Threads_2026-11-27). The keys are the player's own (the key file); nothing is shipped.
+//
+// <keys>.built lists the keys built into the cache file under this GPU, driver build and [nvn] spirv_salt, so a second run builds only what
+// play recorded since (or nothing, without reading the cache). Each pipeline is destroyed as soon as it is made, as in the cache rewarm.
+// What was built is also added to the cache rewarm's list (<keys>.rewarm), so the rewarm of the next session does not build it again.
+namespace {
+constexpr char kBuiltMagic[8] = {'N', 'X', 'P', 'K', 'B', 'L', 'T', '1'};
+constexpr size_t kBuiltIdBytes = 256;
+
+// What the pipelines this build makes depend on besides the GPU and driver: this file's record scheme (kBuildScheme: raise it when
+// build_graphics_pipeline or the stand-in keys change what is submitted), the runtime build (nxrt::app_build: version and commit), the
+// executable (size and time: a Set up links a new one), and the settings that change the modules or the pipeline state. One 64-bit hash.
+constexpr uint32_t kBuildScheme = 1;
+uint64_t runtime_fingerprint() {
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&h](const std::string& t) {
+        for (unsigned char c : t) h = (h ^ c) * 1099511628211ull;
+        h = (h ^ 0xffu) * 1099511628211ull;                   // a separator, so "ab"+"c" differs from "a"+"bc"
+    };
+    mix(std::to_string(kBuildScheme));
+    mix(nxrt::app_build());
+#if defined(_WIN32)
+    wchar_t exe[1024];
+    const DWORD n = GetModuleFileNameW(nullptr, exe, 1024);
+    if (n > 0 && n < 1024) {
+        std::error_code ec;
+        const std::filesystem::path p(std::wstring(exe, n));
+        const uintmax_t bytes = std::filesystem::file_size(p, ec);
+        const auto when = std::filesystem::last_write_time(p, ec);
+        mix(std::to_string(ec ? 0 : bytes) + "/" + std::to_string(ec ? 0 : static_cast<long long>(when.time_since_epoch().count())));
+    }
+#endif
+    // nvn_pipeline.cpp (create_module, build_graphics_pipeline, layouts) and the shader cache: each value as the ini or environment gives it
+    static const char* const kKeys[][2] = {
+        {"nvn", "robust_ubo"}, {"nvn", "shading_rate"}, {"nvn", "init_outputs"}, {"nvn", "float_atomic_add"}, {"nvn", "relax_exact"},
+        {"nvn", "no_unroll"}, {"nvn", "shader_replace_dir"}, {"nvn", "alpha_test"}, {"nvn", "push_uniforms"}, {"nvn", "gfx_ssbo_readonly"},
+        {"nvn", "int_fetch_retype"}, {"nvn", "edited_shaders"}, {"nvn", "edited_shaders_dir"}, {"nvn", "shader_cache"}, {"gfx", "lower_float64"},
+    };
+    for (const auto& k : kKeys) mix(std::string(k[0]) + "." + k[1] + "=" + (config_has(k[0], k[1]) ? config_get_str(k[0], k[1], "") : std::string("-")));
+    return h;
+}
+
+// The GPU and driver build (the cache's identity and the driver version), the shader cache (the size of its results.tsv: a Set up that
+// translates the shaders again changes it, and keys whose shaders were missing may build now), the runtime and its settings
+// (runtime_fingerprint) and the measurement salt.
+std::string build_identity() {
+    std::error_code ec;
+    const uintmax_t tsv = shader_cache().is_open() ? std::filesystem::file_size(std::filesystem::path(shader_cache().dir()) / "results.tsv", ec) : 0;
+    char b[128];
+    std::snprintf(b, sizeof b, " driver=%u shaders=%llu rt=%016llx", device().properties().driverVersion, ec ? 0ull : static_cast<unsigned long long>(tsv),
+                  static_cast<unsigned long long>(runtime_fingerprint()));
+    std::string id = pipeline_cache_identity() + b + " salt=" + config_get_str("nvn", "spirv_salt", "");
+    if (id.size() > kBuiltIdBytes - 1) id.resize(kBuiltIdBytes - 1);
+    return id;
+}
+
+// The size of the pipeline cache file now (0: none). Play only ever adds to the file; one smaller than when the list was written was replaced
+// (deleted, or made again after it could not be read), and the list no longer says what is in it.
+uint64_t cache_file_bytes() {
+    std::error_code ec;
+    const uintmax_t n = std::filesystem::file_size(config_get_str("nvn", "pipeline_cache", "pipeline_cache.bin"), ec);
+    return ec ? 0 : static_cast<uint64_t>(n);
+}
+
+// File: magic, version 1, the identity (kBuiltIdBytes, zero-padded), the cache file's size when the list was written, then one digest
+// (8 bytes) per key built into the cache.
+std::unordered_set<uint64_t> load_built(const std::string& path, const std::string& identity, const char** why_not) {
+    std::unordered_set<uint64_t> done;
+    *why_not = nullptr;
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return done;
+    char magic[8], id[kBuiltIdBytes] = {};
+    uint32_t ver = 0;
+    uint64_t bytes = 0;
+    f.read(magic, 8);
+    f.read(reinterpret_cast<char*>(&ver), 4);
+    f.read(id, sizeof id);
+    f.read(reinterpret_cast<char*>(&bytes), 8);
+    if (!f || std::memcmp(magic, kBuiltMagic, 8) != 0 || ver != 1) return done;
+    if (identity != std::string(id, strnlen(id, sizeof id))) {
+        *why_not = "the GPU, the driver build, the shader cache, the runtime build or its pipeline settings, or [nvn] spirv_salt changed";
+        return done;
+    }
+    if (cache_file_bytes() < bytes) {
+        *why_not = "the pipeline cache file was replaced (it is smaller than after the last build)";
+        return done;
+    }
+    uint64_t d;
+    while (f.read(reinterpret_cast<char*>(&d), 8)) done.insert(d);
+    return done;
+}
+
+bool save_built(const std::string& path, const std::string& identity, const std::unordered_set<uint64_t>& done) {
+    const std::string tmp = path + ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (!f) return false;
+        const uint32_t ver = 1;
+        const uint64_t bytes = cache_file_bytes();
+        char id[kBuiltIdBytes] = {};
+        std::memcpy(id, identity.data(), std::min(identity.size(), sizeof id - 1));
+        f.write(kBuiltMagic, 8);
+        f.write(reinterpret_cast<const char*>(&ver), 4);
+        f.write(id, sizeof id);
+        f.write(reinterpret_cast<const char*>(&bytes), 8);
+        for (uint64_t d : done) f.write(reinterpret_cast<const char*>(&d), 8);
+        if (!f) return false;
+    }
+    std::error_code ec;
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) {
+        std::filesystem::remove(path, ec);
+        std::filesystem::rename(tmp, path, ec);
+    }
+    return !ec;
+}
+}  // namespace
+
+bool prewarm_build_all(const nxrt::nvn::PipelineBuildOptions& o, nxrt::nvn::PipelineBuildResult* res) {
+    nxrt::nvn::PipelineBuildResult local;
+    nxrt::nvn::PipelineBuildResult& r = res ? *res : local;
+    r = nxrt::nvn::PipelineBuildResult{};
+    r.gpu = device().properties().deviceName;
+    r.identity = build_identity();
+    if (!shader_cache().is_open()) { r.error = "no shader cache is open ([nvn] shader_cache)"; return false; }
+    if (config_get_str("nvn", "pipeline_cache", "pipeline_cache.bin").empty()) {
+        r.error = "[nvn] pipeline_cache is empty: there is no pipeline cache file to build into";
+        return false;
+    }
+
+    // The key file and the session each key was last drawn in, read with the prewarm's own readers; the prewarm's state is left as it was.
+    std::vector<Rec> recs;
+    std::vector<uint32_t> last_seen;
+    std::string keys_path;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        if (g_inited) { r.error = "the pipeline prewarm of this process is running"; return false; }
+        keys_path = config_get_str("nvn", "pipeline_keys", "pipeline_keys.bin");
+        if (keys_path.empty()) { r.error = "[nvn] pipeline_keys is empty: no keys are recorded"; return false; }
+        const PrewarmStats keep = g_stats;
+        g_path = keys_path;
+        g_recs.clear();
+        g_by_any.clear();
+        g_digests.clear();
+        g_seen.clear();
+        load_file();
+        load_seen();
+        recs.swap(g_recs);
+        last_seen.reserve(recs.size());
+        for (const Rec& rec : recs) {
+            auto it = g_seen.find(digest_of(rec.h, rec.rest));
+            last_seen.push_back(it == g_seen.end() ? 0u : it->second);
+        }
+        g_by_any.clear();
+        g_digests.clear();
+        g_seen.clear();
+        g_session = 1;
+        g_stats = keep;
+    }
+    r.keys = recs.size();
+    const std::string list_path = keys_path + ".built";
+
+    // What the cache file already holds: the list, when the file's header is this driver's and the list is for this GPU, driver and salt.
+    const PipelineCacheOrigin peek = pipeline_cache_peek();
+    const char* why_not = nullptr;
+    std::unordered_set<uint64_t> done = load_built(list_path, r.identity, &why_not);
+    if (why_not) NXLOG_I(kTag, "pipeline build: %s since the last build: every key is built again", why_not);
+    if (peek != PipelineCacheOrigin::loaded && !done.empty()) {
+        NXLOG_I(kTag, "pipeline build: the pipeline cache file is %s: the list of %zu built keys starts over",
+                peek == PipelineCacheOrigin::none ? "missing" : peek == PipelineCacheOrigin::stale ? "from another driver build" : "unreadable", done.size());
+        done.clear();
+    }
+    if (o.force) done.clear();
+    // most recently drawn first, as the boot queue: what a Skip leaves out is what the player has not seen for longest
+    auto todo_of = [&] {
+        std::vector<size_t> v;
+        for (size_t i = 0; i < recs.size(); ++i)
+            if (!done.count(digest_of(recs[i].h, recs[i].rest))) v.push_back(i);
+        std::stable_sort(v.begin(), v.end(), [&](size_t a, size_t b) { return last_seen[a] > last_seen[b]; });
+        return v;
+    };
+    std::vector<size_t> todo = todo_of();
+    r.todo = todo.size();
+    if (todo.empty()) {
+        r.already_ready = true;
+        NXLOG_I(kTag, "pipeline build: nothing to do, the %zu recorded keys are in the pipeline cache for %s (%s)", recs.size(), r.gpu.c_str(), r.identity.c_str());
+        if (o.progress) o.progress(0, 0);
+        return true;
+    }
+    const PipelineCacheOrigin origin = pipeline_cache_open();      // reads the cache file (the header said it is usable, or it is not used)
+    if (origin != PipelineCacheOrigin::loaded && !done.empty()) {  // the header looked right but the driver did not take the file
+        done.clear();
+        todo = todo_of();
+        r.todo = todo.size();
+    }
+    const unsigned hw = std::max(1u, nxrt::host_threads());
+    const int threads = static_cast<int>(std::clamp<size_t>(o.threads > 0 ? static_cast<size_t>(o.threads) : (hw > 3 ? hw - 2 : 1), 1, todo.size()));
+    r.threads = threads;
+    if (o.started) o.started(r);
+    NXLOG_I(kTag, "pipeline build: %zu of %zu recorded keys to build on %d threads (%s; %s, cache file %s)", todo.size(), recs.size(), threads,
+            o.force ? "all of them: forced" : "those not built yet for this GPU and driver", r.gpu.c_str(),
+            origin == PipelineCacheOrigin::loaded ? "loaded" : origin == PipelineCacheOrigin::stale ? "out of date" : origin == PipelineCacheOrigin::none ? "new" : "unreadable");
+
+    std::atomic<size_t> next{0};
+    std::atomic<uint64_t> built{0}, failed{0}, missing{0};
+    std::atomic<int> running{threads};
+    std::atomic<bool> stop{false};
+    std::mutex mu;
+    std::vector<uint64_t> fresh;                                    // digests built into the cache, in the order they finished
+    std::vector<uint64_t> unbuildable;                              // digests with no stand-in shader or layout: listed too, so a run with
+                                                                    // only those left is "ready" (a draw of the game still builds them)
+    std::vector<float> each;
+    auto work = [&] {
+        log_set_thread_name("nvn-build");                          // normal priority, no efficiency mode: nothing else is running
+        for (;;) {
+            if (stop.load(std::memory_order_relaxed)) break;
+            const size_t i = next.fetch_add(1);
+            if (i >= todo.size()) break;
+            const Rec& rec = recs[todo[i]];
+            GraphicsKey k;
+            const ProgLayout* pl = nullptr;
+            VkPipeline p = VK_NULL_HANDLE;
+            const auto t0 = std::chrono::steady_clock::now();
+            const bool stubs = stub_key(rec, k, pl);
+            if (stubs) {
+                NXFT("prewarm.build_all");
+                p = build_graphics_pipeline(k, *pl);
+            }
+            const float ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            if (p) vkDestroyPipeline(vkdev(), p, nullptr);          // the cache keeps the code
+            if (p) {
+                std::lock_guard<std::mutex> lk(mu);
+                fresh.push_back(digest_of(rec.h, rec.rest));
+                if (each.size() < 8192) each.push_back(ms);
+                built.fetch_add(1);
+            } else {
+                failed.fetch_add(1);
+                if (!stubs) {
+                    missing.fetch_add(1);
+                    std::lock_guard<std::mutex> lk(mu);
+                    unbuildable.push_back(digest_of(rec.h, rec.rest));
+                }
+            }
+        }
+        running.fetch_sub(1);
+    };
+    // What finished before a save is in the file it wrote: those keys join the list, which is written after the cache file.
+    size_t committed = 0, unbuildable_listed = 0;
+    auto checkpoint = [&] {
+        size_t n, m;
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            n = fresh.size();
+            m = unbuildable.size();
+        }
+        if (n <= committed && m <= unbuildable_listed) return;
+        bool saved = false;
+        if (n > committed) {
+            saved = pipeline_cache_save();
+            if (!saved) NXLOG_W(kTag, "pipeline build: writing the pipeline cache file failed; the keys built since the last save are not listed as built");
+        }
+        std::lock_guard<std::mutex> lk(mu);
+        if (saved) {
+            for (size_t i = committed; i < n; ++i) done.insert(fresh[i]);
+            committed = n;
+        }
+        for (size_t i = unbuildable_listed; i < m; ++i) done.insert(unbuildable[i]);
+        unbuildable_listed = m;
+        save_built(list_path, r.identity, done);
+    };
+    const auto t_start = std::chrono::steady_clock::now();
+    std::vector<std::thread> pool;
+    for (int t = 0; t < threads; ++t) pool.emplace_back(work);
+    auto last_save = t_start;
+    uint64_t beat = ~0ull;
+    for (;;) {
+        const bool finished = running.load() == 0;
+        // no frames are presented: a build that moves keeps the freeze watchdog ([diag] watchdog_boot_seconds) quiet
+        if (const uint64_t moved = built.load() + failed.load(); moved != beat) {
+            beat = moved;
+            nxrt::diag_progress();
+        }
+        if (o.progress && !o.progress(built.load() + failed.load(), todo.size())) stop.store(true);
+        if (finished) break;
+        // a run that is ended from outside (the launcher's Skip after its grace time, a closed console) keeps most of its work
+        if (std::chrono::steady_clock::now() - last_save >= std::chrono::seconds(60)) {
+            checkpoint();
+            last_save = std::chrono::steady_clock::now();
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    for (auto& t : pool) t.join();
+    r.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+    checkpoint();
+    r.built = built.load();
+    r.failed = failed.load();
+    r.missing_shaders = missing.load();
+    r.cancelled = r.built + r.failed < todo.size();
+    r.median_ms = median_of(each);
+
+    // The cache rewarm of the next session skips what is in the file now. Its list belongs to the cache identity alone (no salt): a salted
+    // (measurement) build is not added to it.
+    if (committed && config_get_str("nvn", "spirv_salt", "").empty()) {
+        std::lock_guard<std::mutex> lk(g_mu);
+        g_path = keys_path;
+        g_rw_identity = pipeline_cache_identity();
+        load_rewarm_locked(g_rw_identity);
+        if (origin != PipelineCacheOrigin::loaded) g_rw_done.clear();   // a new cache file: nothing listed before is in it
+        for (size_t i = 0; i < committed; ++i) g_rw_done.insert(fresh[i]);
+        save_rewarm_locked();
+        g_rw_done.clear();
+        g_rw_identity.clear();
+    }
+    NXLOG_I(kTag, "pipeline build: %s, %llu built (%llu failed, %llu with no usable shader in the cache) of %llu in %.1f s on %d threads, %.1f ms each "
+                  "(median: %s)",
+            r.cancelled ? "stopped" : "done", static_cast<unsigned long long>(r.built), static_cast<unsigned long long>(r.failed),
+            static_cast<unsigned long long>(r.missing_shaders), static_cast<unsigned long long>(r.todo), r.seconds, threads, r.median_ms,
+            r.median_ms < 2.5 ? "the driver had them" : "compiled from scratch");
+    return true;
 }
 
 // The game set a program's shaders: its recorded pipelines go first in line. Programs with both a vertex and a fragment shader also get

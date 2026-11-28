@@ -8,6 +8,7 @@ mod dump;
 mod ini;
 mod locale;
 mod nup;
+mod pipelines;
 mod play;
 mod prepare;
 mod settings;
@@ -48,6 +49,13 @@ struct Config {
     game_art: bool,
     /// Set up's "Experimental: decompiled lighting shader" box (setup.rs lighting_step). Off unless the player ticks it.
     lighting_edit: bool,
+    /// "Build pipelines before play" (pipelines.rs, S1): Play first builds the recorded pipelines when a build is due. Off unless ticked.
+    build_pipelines: bool,
+    /// The graphics drivers the last pipeline build that ended ran with (pipelines::driver_fingerprint; Windows only). Kept after a build
+    /// that failed too, so a failing build is not started again at every Play until something changes.
+    pipelines_driver: String,
+    /// pipelines::log_stamp of the ObeliskChamber.log a build was last started for (one build per cold session).
+    pipelines_cold_log: u64,
 }
 
 fn config_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -505,7 +513,56 @@ fn play(app: AppHandle, state: State<Arc<setup::Shared>>) -> Result<(), String> 
         return Err("Setup is not finished: open Setup and press Set up.".into());
     }
     settings::ensure_play_paths(&p.game_dir, &p)?;
+    if cfg.build_pipelines {
+        let driver = pipelines::driver_fingerprint();
+        let why = pipelines::reasons(&p.game_dir, &p.exe(), &cfg.pipelines_driver, driver.as_deref(), cfg.pipelines_cold_log);
+        if !why.is_empty() {
+            return start_pipeline_build(&app, &p, &cfg, driver, false, Some(cfg.minimize_on_play));
+        }
+    }
     play::start(&app, &p.exe(), &p.game_dir, &exe_dir(), cfg.minimize_on_play, &cfg.runner)
+}
+
+/// Runs ObeliskChamber.exe --build-pipelines (pipelines.rs); a finished build remembers the drivers it ran with.
+fn start_pipeline_build(app: &AppHandle, p: &setup::Paths, cfg: &Config, driver: Option<String>, force: bool, play_after: Option<bool>) -> Result<(), String> {
+    let app2 = app.clone();
+    let log_seen = pipelines::log_stamp(&p.game_dir);
+    let remember = Box::new(move |st: &pipelines::BuildStatus| {
+        let mut c = load_config(&app2);
+        let before = (c.pipelines_driver.clone(), c.pipelines_cold_log);
+        c.pipelines_cold_log = log_seen;
+        // a skipped build is resumed at the next Play (pipelines::reasons); one that ended (done, ready, or an error) is for these drivers
+        if let Some(d) = driver.filter(|_| st.state != "stopped") {
+            c.pipelines_driver = d;
+        }
+        if (c.pipelines_driver.clone(), c.pipelines_cold_log) != before {
+            if let (Ok(text), Ok(path)) = (serde_json::to_string_pretty(&c), config_path(&app2)) {
+                let _ = settings::write_atomic(&path, &text);
+            }
+        }
+    });
+    pipelines::start(app, &p.exe(), &p.game_dir, &exe_dir(), &cfg.runner, force, play_after, remember)
+}
+
+/// The Play page's "Build pipelines" button: builds what is not built yet for this GPU and driver (force: every recorded key).
+#[tauri::command]
+fn build_pipelines(app: AppHandle, state: State<Arc<setup::Shared>>, force: Option<bool>) -> Result<(), String> {
+    if state.progress.lock().unwrap().state == "running" {
+        return Err("Setup is running. Wait for it or pause it first.".into());
+    }
+    let cfg = load_config(&app);
+    let p = paths(&cfg)?;
+    if !setup::complete(&p) {
+        return Err("Setup is not finished: open Setup and press Set up.".into());
+    }
+    settings::ensure_play_paths(&p.game_dir, &p)?;
+    start_pipeline_build(&app, &p, &cfg, pipelines::driver_fingerprint(), force.unwrap_or(false), None)
+}
+
+/// Skip: the build saves what it has and ends (a Play that started it then starts the game).
+#[tauri::command]
+fn skip_pipelines() {
+    pipelines::skip();
 }
 
 /// Linux: whether Steam is installed and the shortcut to ObeliskChamber.exe exists.
@@ -730,6 +787,8 @@ fn main() {
             start_setup,
             cancel_setup,
             play,
+            build_pipelines,
+            skip_pipelines,
             game_status,
             steam_status,
             add_to_steam,

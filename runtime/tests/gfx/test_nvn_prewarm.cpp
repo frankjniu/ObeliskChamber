@@ -331,3 +331,77 @@ NXTEST(cache_saved_while_running) {
     CHECK(size > 0);
     app.shutdown();
 }
+
+// The pipeline build before play (S1, nxrt::nvn::build_pipelines): run 1 records the triangle's key; a second process start (a fresh App,
+// no draw yet) builds it into the cache with no game running and lists it in <keys>.built; a third finds nothing to do and does not read
+// the cache; force builds it again; the prewarm of a running session refuses the build.
+NXTEST(build_all_before_play) {
+    if (!real_data_available()) { nxtest::skip("work/shader_cache not found"); return; }
+    TempDir td;
+    const fs::path keys = td.path / "pipeline_keys.bin", cache = td.path / "pipeline_cache.bin";
+    PrewarmConfig cfg(keys, cache);
+    App::Opts o;
+    o.width = 64;
+    o.height = 48;
+    {
+        App app;
+        REQUIRE(app.init(o));
+        std::vector<uint8_t> px;
+        REQUIRE(draw_triangle(app, &px));
+        app.shutdown();
+    }
+    std::error_code ec;
+    fs::remove(cache, ec);                     // as after a driver update: the cache has nothing
+    {
+        App app;
+        REQUIRE(app.init(o));
+        nxrt::nvn::PipelineBuildOptions bo;
+        bo.threads = 2;
+        uint64_t calls = 0, last_total = 0;
+        bool started = false;
+        bo.progress = [&](uint64_t, uint64_t total) { ++calls; last_total = total; return true; };
+        bo.started = [&](const nxrt::nvn::PipelineBuildResult& at) { started = at.todo >= 1 && at.threads >= 1; };
+        nxrt::nvn::PipelineBuildResult r;
+        REQUIRE(nxrt::nvn::build_pipelines(bo, &r));
+        std::printf("    build 1: keys %llu, todo %llu, built %llu, failed %llu, %.2f s, %.2f ms median, %d threads, %s\n",
+                    static_cast<unsigned long long>(r.keys), static_cast<unsigned long long>(r.todo), static_cast<unsigned long long>(r.built),
+                    static_cast<unsigned long long>(r.failed), r.seconds, r.median_ms, r.threads, r.identity.c_str());
+        CHECK(r.keys >= 1);
+        CHECK_EQ(r.todo, r.keys);
+        CHECK_EQ(r.built, r.todo);
+        CHECK_EQ(r.failed, 0ull);
+        CHECK(!r.cancelled);
+        CHECK(!r.already_ready);
+        CHECK(started);
+        CHECK(calls >= 1);
+        CHECK_EQ(last_total, r.todo);
+        bool exists = false;
+        CHECK(file_bytes(cache, &exists) > 0);
+        CHECK(exists);
+        CHECK(file_bytes(fs::path(keys.string() + ".built"), &exists) > 8 + 4 + 256 + 8);
+        CHECK(exists);
+
+        nxrt::nvn::PipelineBuildResult again;
+        REQUIRE(nxrt::nvn::build_pipelines(bo, &again));
+        CHECK(again.already_ready);
+        CHECK_EQ(again.todo, 0ull);
+        CHECK_EQ(again.built, 0ull);
+
+        bo.force = true;
+        nxrt::nvn::PipelineBuildResult forced;
+        REQUIRE(nxrt::nvn::build_pipelines(bo, &forced));
+        CHECK_EQ(forced.todo, forced.keys);
+        CHECK_EQ(forced.built, forced.todo);
+        CHECK(forced.median_ms < 50.0);          // from the cache just written
+
+        std::vector<uint8_t> px;                 // the session's prewarm starts with the program: the build is refused meanwhile
+        REQUIRE(draw_triangle(app, &px));
+        check_triangle(px);
+        nxrt::nvn::PipelineBuildResult refused;
+        CHECK(!nxrt::nvn::build_pipelines(bo, &refused));
+        CHECK(!refused.error.empty());
+        const auto v = app.validation();
+        CHECK_EQ(v.errors, 0ull);
+        app.shutdown();
+    }
+}

@@ -161,6 +161,8 @@ const SECTIONS = [
       { id: 'game_dir', type: 'path', label: 'settings.gameDir.label', sec: '', key: 'game_dir', def: '', placeholder: 'settings.gameDir.placeholder', hint: 'settings.gameDir.hint' },
       { id: 'jobs', type: 'number', label: 'settings.jobs.label', sec: '', key: 'jobs', def: '0', min: 0, max: 256, hint: 'settings.jobs.hint' },
       { id: 'minimize_on_play', type: 'toggle', label: 'settings.minimizeOnPlay.label', sec: '', key: 'minimize_on_play', def: '0' },
+      // S1: Play first runs ObeliskChamber.exe --build-pipelines when a build is due (launcher/src-tauri/src/pipelines.rs). Off unless ticked.
+      { id: 'build_pipelines', type: 'toggle', label: 'settings.buildPipelines.label', sec: '', key: 'build_pipelines', def: '0', hint: 'settings.buildPipelines.hint' },
       // The launcher drawn with the game's own menu art, read from the dump at start (src/gameart.js). Read once, when the launcher starts.
       { id: 'game_art', type: 'toggle', label: 'settings.gameArt.label', sec: '', key: 'game_art', def: '0', hint: 'settings.gameArt.hint' },
       // Linux only: ObeliskChamber.exe runs through Wine/Proton (launcher/src-tauri/src/play.rs runner())
@@ -229,7 +231,7 @@ const optName = (label) => (String(label).includes('.') ? t(label) : label);
 export async function render(el, ctx) {
   const [cfg, status] = await Promise.all([api('get_config'), api('game_status')]);
   const data = await api('read_settings').catch(() => ({ game_dir: '', game: {}, controls: {}, controls_exists: false }));
-  const files = { game: data.game, controls: data.controls, config: { repo_dir: cfg.repo_dir, game_dir: cfg.game_dir, jobs: String(cfg.jobs || 0), minimize_on_play: cfg.minimize_on_play ? '1' : '0', game_art: cfg.game_art ? '1' : '0', runner: cfg.runner || '' } };
+  const files = { game: data.game, controls: data.controls, config: { repo_dir: cfg.repo_dir, game_dir: cfg.game_dir, jobs: String(cfg.jobs || 0), minimize_on_play: cfg.minimize_on_play ? '1' : '0', build_pipelines: cfg.build_pipelines ? '1' : '0', game_art: cfg.game_art ? '1' : '0', runner: cfg.runner || '' } };
   const exists = { game: true, controls: data.controls_exists, config: true };
   const keyOf = (f, k) => (f.file === 'config' ? k : `${f.sec}.${k}`);
   const get = (f, k, def) => files[f.file][keyOf(f, k)] ?? def;
@@ -585,7 +587,7 @@ export async function render(el, ctx) {
     for (const f of dirtyFields()) {
       for (const [sec, key, value] of WRITE[f.type](f, model[f.id])) {
         if (f.file === 'config') {
-          cfgNew[key] = key === 'minimize_on_play' || key === 'game_art' ? value === '1' : key === 'jobs' ? parseInt(value, 10) || 0 : key === 'runner' ? String(value).trim() : fwd(value);
+          cfgNew[key] = key === 'minimize_on_play' || key === 'game_art' || key === 'build_pipelines' ? value === '1' : key === 'jobs' ? parseInt(value, 10) || 0 : key === 'runner' ? String(value).trim() : fwd(value);
         } else {
           edits.push({ file: f.file, section: sec, key, value });
         }

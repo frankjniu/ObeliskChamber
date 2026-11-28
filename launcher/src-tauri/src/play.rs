@@ -21,24 +21,33 @@ pub struct ReportFile {
 
 #[derive(Serialize, Clone)]
 pub struct Status {
-    /// "idle", "running" or "exited"
+    /// "idle", "running", "exited", or "building" while the pipeline build before play runs (pipelines.rs)
     pub state: String,
     pub code: Option<i32>,
     pub crashed: bool,
     pub files: Vec<ReportFile>,
     pub message: String,
+    /// "building": pipelines built so far and to build (0 / 0 until the build has counted them)
+    pub done: u64,
+    pub total: u64,
 }
 
 impl Default for Status {
     fn default() -> Self {
-        Status { state: "idle".into(), code: None, crashed: false, files: vec![], message: String::new() }
+        Status { state: "idle".into(), code: None, crashed: false, files: vec![], message: String::new(), done: 0, total: 0 }
     }
 }
 
 #[derive(Default)]
 pub struct PlayState(pub Mutex<Status>);
 
-fn set_status(app: &AppHandle, s: Status) {
+/// The game or the pipeline build before it is running: neither may start again.
+pub fn busy(app: &AppHandle) -> bool {
+    let st = app.state::<PlayState>().0.lock().unwrap().state.clone();
+    st == "running" || st == "building"
+}
+
+pub(crate) fn set_status(app: &AppHandle, s: Status) {
     *app.state::<PlayState>().0.lock().unwrap() = s.clone();
     let _ = app.emit("game-status", s);
 }
@@ -221,9 +230,54 @@ fn on_path(name: &str) -> bool {
     std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(name).is_file()))
 }
 
+/// The command that starts ObeliskChamber.exe in the run folder `dir` through `runner` (runner()), with what the game needs around it:
+/// the host environment (not an AppImage's), the runner's NAME=value words, STEAM_COMPAT_MOUNTS for Steam's container, umu-run's GAMEID,
+/// NXRT_LAUNCHER_DIR, and no console window. Play and the pipeline build (pipelines.rs) start it the same way.
+pub fn game_command(exe: &Path, dir: &Path, launcher_dir: &Path, runner: &[String]) -> Command {
+    // leading NAME=value words are environment variables, as in a shell (there is none in between here)
+    let n = runner.iter().take_while(|w| w.split_once('=').is_some_and(|(k, _)| !k.is_empty() && !k.contains('/'))).count();
+    let (assign, words) = runner.split_at(n);
+    let mut cmd = match words.split_first() {
+        None => Command::new(exe),
+        Some((prog, args)) => {
+            let mut c = Command::new(prog);
+            c.args(args).arg(exe);
+            c
+        }
+    };
+    crate::setup::host_env(&mut cmd);
+    cmd.envs(assign.iter().filter_map(|w| w.split_once('=')));
+    // Steam's Proton (and umu-run) run in a container that does not see a dump outside the home folder, /mnt and /media (#142)
+    if !cfg!(windows) && std::env::var_os("STEAM_COMPAT_MOUNTS").is_none() && !assign.iter().any(|w| w.starts_with("STEAM_COMPAT_MOUNTS=")) {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        if let Some(m) = container_mounts(&ini_dirs(dir), home.as_deref()) {
+            cmd.env("STEAM_COMPAT_MOUNTS", m);
+        }
+    }
+    // umu-run wants a game id (it picks protonfixes for known games from it); "0" is the generic one its README uses
+    if is_umu(runner) && std::env::var_os("GAMEID").is_none() && !assign.iter().any(|w| w.starts_with("GAMEID=")) {
+        cmd.env("GAMEID", "0");
+    }
+    // ObeliskChamber.exe reads ObeliskChamber.ini from its working directory: every path comes from there
+    cmd.current_dir(dir);
+    // the upscaler DLLs ship next to the launcher (upscalers/fsr, upscalers/streamline), which need not be the run folder
+    // (on Linux as ObeliskChamber.exe sees it under Wine: Z:/...)
+    if cfg!(windows) {
+        cmd.env("NXRT_LAUNCHER_DIR", launcher_dir);
+    } else {
+        cmd.env("NXRT_LAUNCHER_DIR", crate::dump::game_path(launcher_dir));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: no stray console
+    }
+    cmd
+}
+
 /// `launcher_dir`: the folder the package's upscalers/ is in (the AppImage's folder, not its mount).
 pub fn start(app: &AppHandle, exe: &Path, game_dir: &Path, launcher_dir: &Path, minimize: bool, runner_setting: &str) -> Result<(), String> {
-    if app.state::<PlayState>().0.lock().unwrap().state == "running" {
+    if busy(app) {
         return Err("The game is already running.".into());
     }
     if !exe.is_file() {
@@ -236,44 +290,7 @@ pub fn start(app: &AppHandle, exe: &Path, game_dir: &Path, launcher_dir: &Path, 
     let launcher_dir = launcher_dir.to_path_buf();
     set_status(app, Status { state: "running".into(), message: "Starting ObeliskChamber.exe...".into(), ..Default::default() });
     std::thread::spawn(move || {
-        // leading NAME=value words are environment variables, as in a shell (there is none in between here)
-        let n = runner.iter().take_while(|w| w.split_once('=').is_some_and(|(k, _)| !k.is_empty() && !k.contains('/'))).count();
-        let (assign, words) = runner.split_at(n);
-        let mut cmd = match words.split_first() {
-            None => Command::new(&exe),
-            Some((prog, args)) => {
-                let mut c = Command::new(prog);
-                c.args(args).arg(&exe);
-                c
-            }
-        };
-        crate::setup::host_env(&mut cmd);
-        cmd.envs(assign.iter().filter_map(|w| w.split_once('=')));
-        // Steam's Proton (and umu-run) run in a container that does not see a dump outside the home folder, /mnt and /media (#142)
-        if !cfg!(windows) && std::env::var_os("STEAM_COMPAT_MOUNTS").is_none() && !assign.iter().any(|w| w.starts_with("STEAM_COMPAT_MOUNTS=")) {
-            let home = std::env::var_os("HOME").map(PathBuf::from);
-            if let Some(m) = container_mounts(&ini_dirs(&dir), home.as_deref()) {
-                cmd.env("STEAM_COMPAT_MOUNTS", m);
-            }
-        }
-        // umu-run wants a game id (it picks protonfixes for known games from it); "0" is the generic one its README uses
-        if is_umu(&runner) && std::env::var_os("GAMEID").is_none() && !assign.iter().any(|w| w.starts_with("GAMEID=")) {
-            cmd.env("GAMEID", "0");
-        }
-        // ObeliskChamber.exe reads ObeliskChamber.ini from its working directory: every path comes from there
-        cmd.current_dir(&dir);
-        // the upscaler DLLs ship next to the launcher (upscalers/fsr, upscalers/streamline), which need not be the run folder
-        // (on Linux as ObeliskChamber.exe sees it under Wine: Z:/...)
-        if cfg!(windows) {
-            cmd.env("NXRT_LAUNCHER_DIR", &launcher_dir);
-        } else {
-            cmd.env("NXRT_LAUNCHER_DIR", crate::dump::game_path(&launcher_dir));
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: no stray console
-        }
+        let mut cmd = game_command(&exe, &dir, &launcher_dir, &runner);
         let started = SystemTime::now();
         let mut child = match cmd.spawn() {
             Ok(c) => c,
@@ -321,7 +338,7 @@ pub fn start(app: &AppHandle, exe: &Path, game_dir: &Path, launcher_dir: &Path, 
             (None, Some(c)) => format!("ObeliskChamber.exe exited with code {} (0x{:08X}).", c, c as u32),
             (None, None) => "ObeliskChamber.exe was ended by the system.".to_string(),
         };
-        set_status(&app2, Status { state: "exited".into(), code, crashed, files, message });
+        set_status(&app2, Status { state: "exited".into(), code, crashed, files, message, ..Default::default() });
         if minimize {
             if let Some(w) = app2.get_webview_window("main") {
                 let _ = w.unminimize();

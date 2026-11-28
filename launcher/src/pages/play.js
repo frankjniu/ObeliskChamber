@@ -5,6 +5,7 @@ import { statusText, stepTitle } from '../rusttext.js';
 const hex = (c) => '0x' + (c >>> 0).toString(16).toUpperCase().padStart(8, '0');
 
 function statusChip(s) {
+  if (s.state === 'building') return `<span class="chip warn">${icon('loader-circle', 'spin')}${esc(t('play.building'))}</span>`;
   if (s.state === 'running') return `<span class="chip warn">${icon('loader-circle', 'spin')}${esc(t('play.running'))}</span>`;
   if (s.state === 'exited') {
     const code = s.code === null || s.code === undefined ? t('play.noExitCode') : t('play.codeWithHex', { code: s.code, hex: hex(s.code) });
@@ -17,6 +18,19 @@ function statusChip(s) {
 
 /* The line a run ends with comes from play.rs in English; rusttext.js translates it. */
 const statusMsg = (s) => statusText(s);
+
+/* The pipeline build before play (pipelines.rs, S1): its progress and the Skip button. */
+function buildHtml(s) {
+  if (s.state !== 'building') return '';
+  const pct = s.total ? Math.min(100, Math.round((100 * s.done) / s.total)) : 0;
+  return `
+    <div class="card">
+      <h2>${icon('loader-circle', 'spin')}${esc(t('play.buildTitle'))}<span class="grow"></span><button class="btn" id="skip-build">${esc(t('play.buildSkip'))}</button></h2>
+      <p class="dim">${esc(statusMsg(s))}</p>
+      <progress max="100" ${s.total ? `value="${pct}"` : ''}></progress>
+      <p class="faint">${esc(t('play.buildHint'))}</p>
+    </div>`;
+}
 
 function reportHtml(s) {
   if (s.state !== 'exited') return '';
@@ -42,7 +56,7 @@ export async function render(el, ctx) {
   let addingSteam = false;
 
   function draw() {
-    const running = status.state === 'running';
+    const running = status.state === 'running' || status.state === 'building';
     const problems = [];
     if (!ov.repo_ok) problems.push(t('play.problemRepo'));
     else if (!cfg.dump_dir) problems.push(t('play.problemNoDump'));
@@ -58,6 +72,7 @@ export async function render(el, ctx) {
         ${problems.map((p) => `<div class="banner danger">${icon('circle-x')}<div>${esc(p)}</div></div>`).join('')}
 
         <button id="play" tabindex="-1" hidden ${ready && !running ? '' : 'disabled'}></button>
+        ${buildHtml(status)}
         ${reportHtml(status)}
 
         <div class="card">
@@ -77,6 +92,7 @@ export async function render(el, ctx) {
           <div class="row wrap">
             <button class="btn" id="open-dir" data-help="${esc(t('play.runFolderContents'))}" ${ov.repo_ok ? '' : 'disabled'}>${icon('folder-open')}${esc(t('play.openRunFolder'))}</button>
             <button class="btn" id="open-mods" data-help="${esc(t('play.modsHint'))}" ${ov.repo_ok ? '' : 'disabled'}>${icon('package')}${esc(t('play.openModsFolder'))}</button>
+            <button class="btn" id="build-pipelines" data-help="${esc(t('play.buildPipelinesHint'))}" ${ready && !running ? '' : 'disabled'}>${icon('gauge')}${esc(t('play.buildPipelines'))}</button>
             ${steam.available ? `<button class="btn" id="add-steam" title="${esc(t('play.addToSteamHint'))}" ${ov.exe_exists && !addingSteam ? '' : 'disabled'}>${icon(addingSteam ? 'loader-circle' : 'gamepad-2', addingSteam ? 'spin' : '')}${esc(t(steam.added ? 'play.updateSteam' : 'play.addToSteam'))}</button>` : ''}
           </div>
         </div>
@@ -87,6 +103,8 @@ export async function render(el, ctx) {
     el.querySelector('#to-setup')?.addEventListener('click', () => ctx.go('setup'));
     el.querySelector('#open-dir')?.addEventListener('click', () => api('open_game_dir').catch((e) => toast(errText(e), 'error')));
     el.querySelector('#open-mods')?.addEventListener('click', () => api('open_mods_dir').catch((e) => toast(errText(e), 'error')));
+    el.querySelector('#build-pipelines')?.addEventListener('click', () => api('build_pipelines', { force: false }).catch((e) => toast(errText(e), 'error')));
+    el.querySelector('#skip-build')?.addEventListener('click', () => api('skip_pipelines').catch((e) => toast(errText(e), 'error')));
     el.querySelector('#add-steam')?.addEventListener('click', async () => {
       addingSteam = true;
       draw();
@@ -105,6 +123,8 @@ export async function render(el, ctx) {
   }
 
   ctx.onStatus((s) => {
+    // a pipeline build that ended without starting the game: say how it went
+    if (status.state === 'building' && s.state === 'idle' && s.message) toast(statusMsg(s), 'ok');
     status = s;
     draw();
   });

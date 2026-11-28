@@ -267,9 +267,23 @@ PipelineCacheOrigin pipeline_cache_open() {
     return g_cache_origin;
 }
 std::string pipeline_cache_identity() { return cache_identity(); }
+PipelineCacheOrigin pipeline_cache_peek() {
+    if (g_cache_ready.load(std::memory_order_acquire)) return g_cache_origin;
+    const std::string path = config_get_str("nvn", "pipeline_cache", "pipeline_cache.bin");
+    if (path.empty()) return PipelineCacheOrigin::none;
+    std::vector<char> head(32);
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return PipelineCacheOrigin::none;
+    const size_t n = std::fread(head.data(), 1, head.size(), f);
+    std::fclose(f);
+    if (n == 0) return PipelineCacheOrigin::none;                 // ensure_cache treats an empty file as no file
+    head.resize(n);
+    std::string why;
+    return check_header(head, &why);
+}
 // The write at the end of a session: skipped when the cache is the big one of a preparation and little was added.
 void pipeline_cache_flush() {
-    if (!g_cache_big || g_new_since_save.load(std::memory_order_relaxed) >= 300) save_cache();
+    if (g_cache_dirty.load(std::memory_order_relaxed) && (!g_cache_big || g_new_since_save.load(std::memory_order_relaxed) >= 300)) save_cache();
 }
 
 bool GraphicsKey::operator==(const GraphicsKey& o) const { return std::memcmp(this, &o, sizeof *this) == 0; }
@@ -2179,7 +2193,8 @@ void pipeline_shutdown() {
         g_comp_jobs.clear();
         g_comp_stats = CompStats{};
     }
-    if (!g_cache_big || g_new_since_save.load() >= 300) save_cache();
+    // nothing new since the last save (the saver thread, a pipeline build): the file on disk is the cache already
+    if (g_cache_dirty.load() && (!g_cache_big || g_new_since_save.load() >= 300)) save_cache();
     for (auto& [h, bucket] : g_gfx)
         for (auto& e : bucket) {
             if (e.second) vkDestroyPipeline(d, e.second, nullptr);

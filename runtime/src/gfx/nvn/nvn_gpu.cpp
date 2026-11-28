@@ -1919,6 +1919,12 @@ bool prepare_shaders(const ShaderPrepareOptions& o, ShaderPrepareResult* r) {
     if (!be::gpu::active()) { out = ShaderPrepareResult{}; out.error = "the graphics back end is not running"; return false; }
     return be::gpu::gpl_prepare(o, &out);
 }
+bool build_pipelines(const PipelineBuildOptions& o, PipelineBuildResult* r) {
+    PipelineBuildResult local;
+    PipelineBuildResult& out = r ? *r : local;
+    if (!be::gpu::active()) { out = PipelineBuildResult{}; out.error = "the graphics back end is not running"; return false; }
+    return be::gpu::prewarm_build_all(o, &out);
+}
 bool backend_installed() { return be::gpu::active(); }
 void backend_flush_caches() {
     if (be::gpu::active()) be::gpu::flush_caches();
