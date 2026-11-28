@@ -142,6 +142,12 @@ class Env:
         self.jt = {}                  # address of a `br` -> sorted list of target addresses (jumptables.py)
         self.tailbr = set()           # addresses of unresolved `br xN` that are indirect tail calls (jumptables.py)
         self.nonabi = frozenset()     # entries reached by a branch inside one guest function, not by an ABI call (opt.temps_local)
+        # Absolute [lo, hi) ranges of bytes mods patched (exefs .ips / .pchtxt, --plain). A function holding any of them is lifted
+        # without the 'flags' and 'tregs' optimizations: both assume the AAPCS64 (no condition flags live across a call or a return,
+        # nothing carried in x9..x17 through a call), which the game's compiled code keeps and hand-written mod code often does not
+        # (a stub reached by BL that takes its input in x9..x11 or returns its result in w16; a loop whose `subs` and `b.ne` are in two
+        # stubs joined by a B). Without them every register and the flags meet the context at each call and return, as on an emulator.
+        self.plain = []
         self.pads = []                # sorted landing pad addresses
         self.catchers = set()         # entries of functions entered through nx_catch_call
         self.eh_starts = set()        # entries of functions that have an LSDA
@@ -238,6 +244,13 @@ class Env:
         self.starts = sorted(self.ends)
         # an extra entry splits the function it falls into: keep that function's end as is
         return self.starts
+
+    def holds_plain(self, lo, hi):
+        """Whether [lo, hi) holds a byte a mod patched (self.plain, sorted and disjoint)."""
+        if not self.plain:
+            return False
+        i = bisect.bisect_right(self.plain, (hi,))
+        return i > 0 and any(a < hi and b > lo for a, b in self.plain[max(0, i - 2):i])
 
     def extent(self, entry):
         if entry in self.ends:
@@ -442,11 +455,12 @@ def lift_function(env, entry):
     out.append('}')
     text = '\n'.join(out)
     if env.opt:
-        text, info = opt.optimize(text, flags_abi='flags' in env.opt, xregs='xregs' in env.opt, vregs='vregs' in env.opt,
-                                  vstore='vstore' in env.opt)
+        modded = env.holds_plain(entry, end)
+        text, info = opt.optimize(text, flags_abi='flags' in env.opt and not modded, xregs='xregs' in env.opt,
+                                  vregs='vregs' in env.opt, vstore='vstore' in env.opt)
         if info.get('flag_entry') or info.get('flag_after_call'):
             env.opt_flag_notes.append((entry, bool(info.get('flag_entry')), bool(info.get('flag_after_call'))))
-        if 'tregs' in env.opt and not info.get('skipped'):
+        if 'tregs' in env.opt and not info.get('skipped') and not modded:
             text, _ = opt.temps_local(text, env.nonabi)
     if two:
         text += '\n%svoid f_%x(Ctx *__restrict NX_NOESC c) { %s }' % (sec, entry, 'nx_catch_call(c, u_%x);' % entry if entry in env.catchers else 'u_%x(c, 0);' % entry)
@@ -470,6 +484,7 @@ def make_env(spec):
     env.jt = {int(k): v for k, v in spec['jt'].items()}
     env.tailbr = set(spec.get('tailbr', ()))
     env.nonabi = frozenset(spec.get('nonabi', ()))
+    env.plain = [(img.base + lo, img.base + hi) for lo, hi in spec.get('plain', ())] if spec.get('plain') else []
     env.pads = spec['pads']
     env.catchers = set(spec['catchers'])
     env.full = True
@@ -581,6 +596,9 @@ def lift_module(spec, outdir, jobs=8, shards=0, bucket=0xC000, log=print):
         env.patches = load_patches(spec['patches'], img)
     if spec.get('sites'):
         load_sites(spec['sites'], env)
+    env.plain = [(img.base + lo, img.base + hi) for lo, hi in spec.get('plain', ())] if spec.get('plain') else []
+    if env.plain:
+        log('mod-patched bytes: %d range(s); the functions holding them are lifted without flags / tregs' % len(env.plain))
     env.compute_starts()
     for a in sorted(env.sites['midhook']):                 # a mid-function hook makes its address a function of its own
         if a not in env.ends:

@@ -1174,8 +1174,31 @@ class Runner:
         return rc, '\n'.join(tail)
 
 
-def lift(runner, exefs, gen, jobs, sites):
-    """One lifter process per module (the lifter itself runs `jobs` worker processes); main with the site list `sites`."""
+def write_plain_ranges(path, patches, applied):
+    """The bytes the applied mods patched in main, as merged word-aligned `lo hi` memory offsets (hex), for the lifter's --plain: the
+    functions holding them are lifted without the flags and tregs optimizations (recomp/nxrecomp/program.py Env.plain), because
+    hand-written mod code need not keep the AAPCS64 those assume (a stub reached by BL that takes x9..x11 or returns in w16, a loop
+    split over two stubs with its flags live across the B). -> the path, or None when no mod patched main (the file is removed)."""
+    rs = sorted((off & ~3, (off + len(b) + 3) & ~3) for name, _, mem in patches if name in applied for off, b in mem if b)
+    merged = []
+    for lo, hi in rs:
+        if merged and lo <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], hi)
+        else:
+            merged.append([lo, hi])
+    if not merged:
+        if os.path.isfile(path):
+            os.remove(path)
+        return None
+    with open(path, 'w') as f:
+        f.write('# bytes the installed mods patched in main (memory offsets): lifted without flags / tregs\n')
+        f.writelines('%x %x\n' % (lo, hi) for lo, hi in merged)
+    return path
+
+
+def lift(runner, exefs, gen, jobs, sites, plain_ranges=None):
+    """One lifter process per module (the lifter itself runs `jobs` worker processes); main with the site list `sites` and the ranges
+    the mods patched (`plain_ranges`, write_plain_ranges)."""
     for k, (name, nso, base, index, shards) in enumerate(MODULES):
         out = os.path.join(gen, name)
         marker = os.path.join(out, '.lifted')
@@ -1189,6 +1212,8 @@ def lift(runner, exefs, gen, jobs, sites):
                 '--jobs', str(jobs), '--game', 'fefw', '--index', str(index)]
         if name == 'main':
             args += ['--sites', sites]
+            if plain_ranges:
+                args += ['--plain', plain_ranges]
         cmd = [sys.executable, '-I', os.path.abspath(__file__), '--lift-one', json.dumps(args)]
         rc, tail = runner.run(cmd, cwd=RECOMP)
         if rc != 0:
@@ -1537,6 +1562,7 @@ def main():
         mod_sites = collect_mod_sites(game, want['main_build_id'])
         applied, refused = apply_exefs_patches(os.path.join(plain, 'main'), patches, mod_sites)
         left_out_all = dict(left_out, **refused)
+        plain_ranges = write_plain_ranges(os.path.join(build, 'mod_patched.txt'), patches, applied)
         sites = write_sites(os.path.join(plain, 'main'), mod_sites, build)
         stamp = {'format': FORMAT, 'main_build_id': want['main_build_id'], 'sha256': want['sha256'],
                  'tools': tool_stamp(variant, exefs_patch_stamp(patches, left_out), mod_sites_stamp(mod_sites))}
@@ -1554,7 +1580,7 @@ def main():
         env['ZIG_LOCAL_CACHE_DIR'] = os.path.join(build, 'zig-cache')
         gen, obj = os.path.join(build, 'lift'), os.path.join(build, 'obj')
         t = time.time()
-        lift(runner, plain, gen, a.jobs, sites)
+        lift(runner, plain, gen, a.jobs, sites, plain_ranges)
         times['lift'] = round(time.time() - t, 1)
         t = time.time()
         # a profile-guided build's objects are not kept: the key does not cover the profile's contents

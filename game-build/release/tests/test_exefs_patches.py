@@ -280,6 +280,21 @@ class PchtxtBytes(unittest.TestCase):
         self.assertEqual(fb.pchtxt_bytes('1F2003D5', False), bytes.fromhex('1F2003D5'))
 
 
+class PlainRanges(unittest.TestCase):
+    def test_merged_word_aligned_ranges_of_applied_mods(self):
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, 'mod_patched.txt')
+        patches = [('a', 'a/exefs/x.ips', [(0x101, b'\x01\x02'), (0x104, b'\x00' * 4)]),
+                   ('b', 'b/exefs/x.ips', [(0x200, b'\x00' * 8)]),
+                   ('off', 'off/exefs/x.ips', [(0x300, b'\x00' * 4)])]
+        self.assertEqual(fb.write_plain_ranges(p, patches, ['a', 'b']), p)
+        lines = [l for l in open(p).read().splitlines() if not l.startswith('#')]
+        self.assertEqual(lines, ['100 108', '200 208'])
+        self.assertIsNone(fb.write_plain_ranges(p, patches, []))
+        self.assertFalse(os.path.exists(p))
+        shutil.rmtree(d)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=1)
 

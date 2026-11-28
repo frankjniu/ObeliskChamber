@@ -10,12 +10,24 @@ import argparse
 import sys
 
 
+def load_plain(path):
+    """--plain: memory offsets (from the module base, hex) of bytes mods patched, one `lo hi` range per line (# comments)."""
+    out = []
+    with open(path, encoding='utf-8') as f:
+        for line in f:
+            t = line.split('#', 1)[0].split()
+            if len(t) >= 2:
+                out.append((int(t[0], 16), int(t[1], 16)))
+    return sorted(out)
+
+
 def spec_from(a):
     kind = a.kind
     if not kind:
         magic = open(a.input, 'rb').read(4)
         kind = 'nso' if magic == b'NSO0' else 'static_elf'
-    return {'kind': kind, 'path': a.input, 'base': int(a.base, 16), 'name': a.name, 'game': a.game, 'patches': a.patches, 'sites': a.sites, 'index': a.index}
+    return {'kind': kind, 'path': a.input, 'base': int(a.base, 16), 'name': a.name, 'game': a.game, 'patches': a.patches, 'sites': a.sites, 'index': a.index,
+            'plain': load_plain(a.plain) if getattr(a, 'plain', None) else []}
 
 
 def main(argv=None):
@@ -35,6 +47,8 @@ def main(argv=None):
         p.add_argument('--patches')
         p.add_argument('--index', type=int, help='module index (NxModule.index, import ids); default: position in the game config')
         p.add_argument('--sites', help='site list: patches, inline callouts, hooks (see program.load_sites)')
+        p.add_argument('--plain', help='ranges of mod-patched bytes: the functions holding them are lifted without the flags and '
+                                       'tregs optimizations (program.Env.plain)')
     a = ap.parse_args(argv)
     spec = spec_from(a)
     from . import program
