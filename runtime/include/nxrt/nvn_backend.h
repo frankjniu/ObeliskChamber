@@ -95,7 +95,8 @@ bool prepare_shaders(const ShaderPrepareOptions& o, ShaderPrepareResult* r);
 // Pipeline build before play (S1): builds every pipeline of the player's own key file ([nvn] pipeline_keys, recorded by earlier sessions)
 // into the pipeline cache ([nvn] pipeline_cache) on many threads, each destroyed as soon as it exists, then writes the cache. No game code
 // runs: the pipelines are made from the shader cache's stand-in shaders, as the boot prewarm makes them (nvn_prewarm.cpp). Keys already built
-// for this GPU, driver build and [nvn] spirv_salt (the list <pipeline_keys>.built) are skipped unless `force`, so a second run with nothing
+// (or found unbuildable: a shader missing from the cache) for this GPU, driver build, shader cache and [nvn] spirv_salt (the list
+// <pipeline_keys>.built) are skipped unless `force`, so a second run with nothing
 // new costs only the device start. Needs the back end installed (`register_entry_points = false` is enough), an open shader cache, and the
 // boot prewarm not running in this process.
 struct PipelineBuildResult;
@@ -115,7 +116,7 @@ struct PipelineBuildResult {
     int threads = 0;
     bool cancelled = false;
     bool already_ready = false;     // nothing to do (todo == 0)
-    std::string identity;           // "<vendor>:<device>:<pipeline cache UUID> driver=<driverVersion> salt=<[nvn] spirv_salt>"
+    std::string identity;           // "<vendor>:<device>:<pipeline cache UUID> driver=<driverVersion> shaders=<results.tsv bytes> salt=<[nvn] spirv_salt>"
     std::string gpu;                // the device name
     std::string error;              // why nothing could be done
 };

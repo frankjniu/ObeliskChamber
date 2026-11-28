@@ -918,9 +918,13 @@ namespace {
 constexpr char kBuiltMagic[8] = {'N', 'X', 'P', 'K', 'B', 'L', 'T', '1'};
 constexpr size_t kBuiltIdBytes = 256;
 
+// The GPU and driver build (the cache's identity and the driver version), the shader cache (the size of its results.tsv: a Set up that
+// translates the shaders again changes it, and keys whose shaders were missing may build now) and the measurement salt.
 std::string build_identity() {
-    char b[48];
-    std::snprintf(b, sizeof b, " driver=%u", device().properties().driverVersion);
+    std::error_code ec;
+    const uintmax_t tsv = shader_cache().is_open() ? std::filesystem::file_size(std::filesystem::path(shader_cache().dir()) / "results.tsv", ec) : 0;
+    char b[96];
+    std::snprintf(b, sizeof b, " driver=%u shaders=%llu", device().properties().driverVersion, ec ? 0ull : static_cast<unsigned long long>(tsv));
     std::string id = pipeline_cache_identity() + b + " salt=" + config_get_str("nvn", "spirv_salt", "");
     if (id.size() > kBuiltIdBytes - 1) id.resize(kBuiltIdBytes - 1);
     return id;
@@ -950,7 +954,7 @@ std::unordered_set<uint64_t> load_built(const std::string& path, const std::stri
     f.read(reinterpret_cast<char*>(&bytes), 8);
     if (!f || std::memcmp(magic, kBuiltMagic, 8) != 0 || ver != 1) return done;
     if (identity != std::string(id, strnlen(id, sizeof id))) {
-        *why_not = "the GPU, the driver build or [nvn] spirv_salt changed";
+        *why_not = "the GPU, the driver build, the shader cache or [nvn] spirv_salt changed";
         return done;
     }
     if (cache_file_bytes() < bytes) {
@@ -1075,6 +1079,8 @@ bool prewarm_build_all(const nxrt::nvn::PipelineBuildOptions& o, nxrt::nvn::Pipe
     std::atomic<bool> stop{false};
     std::mutex mu;
     std::vector<uint64_t> fresh;                                    // digests built into the cache, in the order they finished
+    std::vector<uint64_t> unbuildable;                              // digests with no stand-in shader or layout: listed too, so a run with
+                                                                    // only those left is "ready" (a draw of the game still builds them)
     std::vector<float> each;
     auto work = [&] {
         log_set_thread_name("nvn-build");                          // normal priority, no efficiency mode: nothing else is running
@@ -1101,27 +1107,37 @@ bool prewarm_build_all(const nxrt::nvn::PipelineBuildOptions& o, nxrt::nvn::Pipe
                 built.fetch_add(1);
             } else {
                 failed.fetch_add(1);
-                if (!stubs) missing.fetch_add(1);
+                if (!stubs) {
+                    missing.fetch_add(1);
+                    std::lock_guard<std::mutex> lk(mu);
+                    unbuildable.push_back(digest_of(rec.h, rec.rest));
+                }
             }
         }
         running.fetch_sub(1);
     };
     // What finished before a save is in the file it wrote: those keys join the list, which is written after the cache file.
-    size_t committed = 0;
+    size_t committed = 0, unbuildable_listed = 0;
     auto checkpoint = [&] {
-        size_t n;
+        size_t n, m;
         {
             std::lock_guard<std::mutex> lk(mu);
             n = fresh.size();
+            m = unbuildable.size();
         }
-        if (n <= committed) return;
-        if (!pipeline_cache_save()) {
-            NXLOG_W(kTag, "pipeline build: writing the pipeline cache file failed; the keys built since the last save are not listed as built");
-            return;
+        if (n <= committed && m <= unbuildable_listed) return;
+        bool saved = false;
+        if (n > committed) {
+            saved = pipeline_cache_save();
+            if (!saved) NXLOG_W(kTag, "pipeline build: writing the pipeline cache file failed; the keys built since the last save are not listed as built");
         }
         std::lock_guard<std::mutex> lk(mu);
-        for (size_t i = committed; i < n; ++i) done.insert(fresh[i]);
-        committed = n;
+        if (saved) {
+            for (size_t i = committed; i < n; ++i) done.insert(fresh[i]);
+            committed = n;
+        }
+        for (size_t i = unbuildable_listed; i < m; ++i) done.insert(unbuildable[i]);
+        unbuildable_listed = m;
         save_built(list_path, r.identity, done);
     };
     const auto t_start = std::chrono::steady_clock::now();
