@@ -387,14 +387,14 @@ void log_thread() {
         // Rebuilt once the registrations have held still for a tick (modules register thousands at boot); the generation also
         // changes when a mod replaces a function at an existing address. The list from two rebuilds ago is freed: a reader holds
         // one only for the length of one fault, and rebuilds are at least 100 ms apart.
-        const uint64_t n = fn_generation();
-        if (n != lifted_for && n == last_count) {
+        const uint64_t gen = fn_generation();
+        if (gen != lifted_for && gen == last_count) {
             const std::vector<uint64_t>* old = g_lifted.exchange(new std::vector<uint64_t>(host_function_starts()), std::memory_order_acq_rel);
             delete retired;
             retired = old;
-            lifted_for = n;
+            lifted_for = gen;
         }
-        last_count = n;
+        last_count = gen;
         if (tick % 5) continue;   // log every 500 ms
         const int n = std::min(g_used.load(std::memory_order_relaxed), kMaxGranules);
         while (logged < n && g_entries[logged].ready.load(std::memory_order_acquire)) {
