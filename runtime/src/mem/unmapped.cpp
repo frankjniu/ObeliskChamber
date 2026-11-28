@@ -385,8 +385,35 @@ bool is_mine(uint64_t granule) {
 }
 void set_mine(uint64_t granule, bool on) {
     const uint64_t i = granule / kGranule, bit = uint64_t(1) << (i % 64);
-    if (on) g_mine[i / 64].fetch_or(bit, std::memory_order_relaxed);
+    if (on) g_mine[i / 64].fetch_or(bit, std::memory_order_release);
     else g_mine[i / 64].fetch_and(~bit, std::memory_order_relaxed);
+}
+// The thread that maps a granule claims it first (two threads faulting on one granule: one maps, the other waits for it).
+std::atomic<uint64_t> g_claim[kHigh / kGranule / 64];
+bool claim(uint64_t granule) {
+    const uint64_t i = granule / kGranule, bit = uint64_t(1) << (i % 64);
+    return !(g_claim[i / 64].fetch_or(bit, std::memory_order_acq_rel) & bit);
+}
+void unclaim(uint64_t granule) {
+    const uint64_t i = granule / kGranule;
+    g_claim[i / 64].fetch_and(~(uint64_t(1) << (i % 64)), std::memory_order_release);
+}
+bool claimed(uint64_t granule) {
+    const uint64_t i = granule / kGranule;
+    return g_claim[i / 64].load(std::memory_order_acquire) >> (i % 64) & 1;
+}
+bool wait_mine(uint64_t granule) {   // another thread claimed it: wait (briefly) until it is mapped
+    for (int n = 0; n < 4000 && !is_mine(granule); ++n) SwitchToThread();
+    return is_mine(granule);
+}
+// Writes dropped per granule: one that the game writes very often (every frame) costs two exceptions a write; past kDropLimit the
+// granule is made writable instead (the writes then stay, as before this was emulated), and that is logged.
+constexpr uint32_t kDropLimit = 20000;
+std::atomic<uint32_t> g_drops[kHigh / kGranule];
+std::atomic<uint64_t> g_dropped{0}, g_kept_writable{0};
+bool drop_ok(uint64_t granule) {
+    g_dropped.fetch_add(1, std::memory_order_relaxed);
+    return g_drops[granule / kGranule].fetch_add(1, std::memory_order_relaxed) < kDropLimit;
 }
 
 LONG CALLBACK on_fault(EXCEPTION_POINTERS* ep) {
@@ -398,7 +425,10 @@ LONG CALLBACK on_fault(EXCEPTION_POINTERS* ep) {
     const ULONG_PTR kind = er->ExceptionInformation[0];   // 0 read, 1 write, 8 execute
     const uint64_t addr = er->ExceptionInformation[1];
     if ((kind != 0 && kind != 1) || addr >= kHigh || !kernel::current_ctx()) return EXCEPTION_CONTINUE_SEARCH;
-    if (addr < kLow) return redirect(ep, addr, kind == 1);   // the null page area can't be mapped
+    if (addr < kLow) {   // the null page area can't be mapped
+        if (kind == 1) g_dropped.fetch_add(1, std::memory_order_relaxed);
+        return redirect(ep, addr, kind == 1);
+    }
     const uint64_t granule = addr & ~(kGranule - 1);
     MEMORY_BASIC_INFORMATION mbi{};
     if (!VirtualQuery(reinterpret_cast<void*>(granule), &mbi, sizeof mbi)) return EXCEPTION_CONTINUE_SEARCH;
@@ -406,20 +436,33 @@ LONG CALLBACK on_fault(EXCEPTION_POINTERS* ep) {
     const bool free = mbi.State == MEM_FREE && reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize >= granule + kGranule;
     if (!reserved && !free) {
         // committed: a zero granule of ours (a write to it: dropped, as on the emulators) or memory of the host's (a reservation)
+        const bool ours = is_mine(granule) || (claimed(granule) && wait_mine(granule));
+        if (kind == 1 && ours && !drop_ok(granule)) {
+            DWORD old = 0;
+            if (VirtualProtect(reinterpret_cast<void*>(granule), kGranule, PAGE_READWRITE, &old)) {
+                if (old != PAGE_READWRITE) g_kept_writable.fetch_add(1, std::memory_order_relaxed);
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+        }
         const LONG r = redirect(ep, addr, kind == 1);
         DWORD old = 0;
-        if (r == EXCEPTION_CONTINUE_SEARCH && kind == 1 && is_mine(granule) &&
+        if (r == EXCEPTION_CONTINUE_SEARCH && kind == 1 && ours &&
             VirtualProtect(reinterpret_cast<void*>(granule), kGranule, PAGE_READWRITE, &old))
             return EXCEPTION_CONTINUE_EXECUTION;   // not lifted code (a native routine): the write stays, as before
         return r;
     }
     if (vm_query(granule).state != kMemFree) return EXCEPTION_CONTINUE_SEARCH;
-    if (kind == 1) {   // a write is dropped (the instruction is pointed at scratch zeros); nothing is mapped for it
+    if (kind == 1 && drop_ok(granule)) {   // a write is dropped (the instruction is pointed at scratch zeros); nothing is mapped for it
         const LONG r = redirect(ep, addr, true);
         if (r != EXCEPTION_CONTINUE_SEARCH) return r;
     }
+    if (!claim(granule))   // another thread is mapping it: run again once it is there
+        return wait_mine(granule) ? EXCEPTION_CONTINUE_EXECUTION : redirect(ep, addr, kind == 1);
     const int slot = g_used.fetch_add(1, std::memory_order_relaxed);
-    if (slot >= kMaxGranules) return EXCEPTION_CONTINUE_SEARCH;
+    if (slot >= kMaxGranules) {
+        unclaim(granule);
+        return redirect(ep, addr, kind == 1);
+    }
     // reads see zeros that stay zeros: read-only, so a later write is dropped too. A write that could not be redirected (not the
     // lifted code) gets a writable granule and stays there.
     const DWORD prot = kind == 1 ? PAGE_READWRITE : PAGE_READONLY;
@@ -429,9 +472,8 @@ LONG CALLBACK on_fault(EXCEPTION_POINTERS* ep) {
     if (!got) {
         g_entries[slot].skip = true;   // the slot is taken: mark it so the logger does not wait on it for ever
         g_entries[slot].ready.store(true, std::memory_order_release);
-        // another thread mapped it first (both faulted on the same granule): the access can run again if it is ours now
-        if (VirtualQuery(reinterpret_cast<void*>(granule), &mbi, sizeof mbi) && mbi.State == MEM_COMMIT) return EXCEPTION_CONTINUE_EXECUTION;
-        return EXCEPTION_CONTINUE_SEARCH;
+        unclaim(granule);
+        return redirect(ep, addr, kind == 1);   // no memory for it (commit limit): the lifted code can still be answered
     }
     Entry& e = g_entries[slot];
     e.addr = addr;
@@ -459,6 +501,7 @@ void log_thread() {
     uint64_t lifted_for = 0, last_count = ~uint64_t(0);
     const std::vector<uint64_t>* retired = nullptr;
     bool full_said = false;
+    uint64_t dropped_said = 0, kept_said = 0;
     for (int tick = 0;; ++tick) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         // Lifted functions registered since the last snapshot (modules load at boot, mods can add replacements): publish a new
@@ -483,6 +526,18 @@ void log_thread() {
         const int nr = std::min(g_redirect_used.load(std::memory_order_relaxed), kMaxRedirectLogs);
         while (logged_redirects < nr && g_redirect_logs[logged_redirects].ready.load(std::memory_order_acquire))
             log_entry(g_redirect_logs[logged_redirects++]);
+        if (tick % 100 == 0) {   // every 10 s
+            const uint64_t d = g_dropped.load(std::memory_order_relaxed), k = g_kept_writable.load(std::memory_order_relaxed);
+            if (d != dropped_said || k != kept_said)
+                NXLOG_I(kTag, "unmapped writes dropped: %llu in all (+%llu in 10 s)%s", static_cast<unsigned long long>(d),
+                        static_cast<unsigned long long>(d - dropped_said),
+                        k ? "; granules written so often that their writes are now kept: see the count" : "");
+            if (k != kept_said)
+                NXLOG_W(kTag, "unmapped writes: %llu granule(s) written more than %u times are writable now (their writes stay)",
+                        static_cast<unsigned long long>(k), kDropLimit);
+            dropped_said = d;
+            kept_said = k;
+        }
         if (logged >= kMaxGranules && !full_said) {
             NXLOG_W(kTag, "unmapped accesses: %d granules mapped, the most there may be: further ones crash", kMaxGranules);
             full_said = true;
@@ -507,7 +562,7 @@ void unmapped_install() {
     // [memory] unmapped_reserve_mb: keep the free granules of the low addresses back (reserved, no access), so that no host
     // allocation made later lands where a mod's stale offset points: the game would read the host's bytes there, where the
     // emulators read 0 (a mod's raw file offsets are a few MB). Reserved, they fault like free memory and are answered the same.
-    const int64_t mb = std::clamp<int64_t>(config_get_int("memory", "unmapped_reserve_mb", 64), 0, 3072);
+    const int64_t mb = std::clamp<int64_t>(config_get_int("memory", "unmapped_reserve_mb", 64), 0, 127);   // below the guest's map region (0x8000000)
     int kept = 0, taken = 0;
     std::string taken_at;
     for (uint64_t g = kLow; g < kLow + uint64_t(mb) * 0x100000; g += kGranule) {
@@ -547,8 +602,10 @@ void unmapped_release(uint64_t addr, uint64_t size) {
     for (uint64_t g = std::max(addr & ~(kGranule - 1), kLow); g < std::min(addr + size, kHigh); g += kGranule) {
         MEMORY_BASIC_INFORMATION mbi{};
         if (is_mine(g) && VirtualQuery(reinterpret_cast<void*>(g), &mbi, sizeof mbi) && mbi.State == MEM_RESERVE &&
-            VirtualFree(reinterpret_cast<void*>(g), 0, MEM_RELEASE))
+            VirtualFree(reinterpret_cast<void*>(g), 0, MEM_RELEASE)) {
             set_mine(g, false);
+            unclaim(g);
+        }
     }
     if (g_used.load(std::memory_order_relaxed) == 0) return;
     const int n = std::min(g_used.load(std::memory_order_relaxed), kMaxGranules);
@@ -559,6 +616,7 @@ void unmapped_release(uint64_t addr, uint64_t size) {
             g = was;
             VirtualFree(reinterpret_cast<void*>(g), 0, MEM_RELEASE);
             set_mine(g, false);
+            unclaim(g);
             NXLOG_I(kTag, "unmapped accesses: the zeroed granule at 0x%llx given back (the guest maps there)", static_cast<unsigned long long>(g));
         }
     }

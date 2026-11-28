@@ -437,7 +437,8 @@ bool merge(Node& base, Node& add, uint32_t& taken, std::string& msg) {
         } else if (it->is_dir && k.is_dir) {
             if (!merge(*it, k, taken, msg)) return false;
         } else if (!it->is_dir && !k.is_dir) {
-            if (it->from_mod) {
+            static int clashes = 0;   // one line per file for the first 50, then one with the count at the end (make_layout)
+            if (it->from_mod && ++clashes <= 50) {
                 std::string from;
                 if (!to_utf8(k.host, from)) from = "?";
                 NXLOG_I("mods", "romfs: %s is in two mods: %s is used ([fs] mod_priority)", it->path.c_str(), from.c_str());
@@ -451,6 +452,7 @@ bool merge(Node& base, Node& add, uint32_t& taken, std::string& msg) {
             // a file where the game has a folder, or the other way round: the overlay's entry replaces the game's
             const std::string name = it->name;
             *it = std::move(k);
+            mark_from_mod(*it);
             it->name = name;
             if (!repath(*it, base.path, msg)) return false;
             taken += count_files(*it);
