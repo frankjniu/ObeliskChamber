@@ -21,12 +21,14 @@
 // Two cases cannot be answered by mapping zeros, because Windows will not map there: the first 64 KiB (the null page area: a mod's
 // empty reference read as 0 is then used as a pointer, and the emulators answer that read with 0 too), and pages Windows reserved for
 // one of our own allocations (host memory is kept low on purpose, so a raw offset of a few MB can land in, say, the reserved tail of a
-// heap segment). For a READ by the lifted game's code there (the function holding the instruction is a registered lifted function), the handler points the instruction's base register at a read-only zero
-// block for one instruction: it decodes only the instruction's memory operand (prefixes, REX / VEX / EVEX, ModRM, SIB), moves the base
-// register by (zero block - fault address), sets the trap flag, and on the single-step that follows puts the register back unless the
-// instruction wrote it. The load reads 0, every other register and the game's memory are untouched, and nothing of the host's is
-// committed or changed. Writes there, faults outside the lifted code, RIP-relative and segment-prefixed operands, and operands whose
-// base register can't be moved crash as before. Each guest instruction answered this way is logged once.
+// heap segment). For an access by the lifted game's code there (the function holding the instruction is a registered lifted
+// function), the handler points the instruction's base register at a block of zeros of the faulting thread's own for one
+// instruction: it decodes only the instruction's memory operand (prefixes, REX / VEX / EVEX, ModRM, SIB), moves the base register by
+// (block - fault address), sets the trap flag, and on the single-step that follows puts the register back unless the instruction
+// wrote it, and zeroes the block around where it pointed. A read reads 0, a write is dropped (as on the emulators: a store into a
+// null object such as [x0 + 0x18]), every other register and the game's memory are untouched, and nothing of the host's is committed
+// or changed. Faults outside the lifted code, RIP-relative and segment-prefixed operands, and operands whose base register can't be
+// moved crash as before. Each guest instruction answered this way is logged once.
 #include "nxrt/memory.h"
 
 #define WIN32_LEAN_AND_MEAN
@@ -37,6 +39,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <thread>
 
 #include "nxrt/config.h"
@@ -68,15 +71,19 @@ void* g_veh = nullptr;
 // ---- one-instruction base-register redirect (null page area and host reservations) ----
 
 // Only instructions on an allowlist are redirected: plain loads into a general register, compares and tests against memory, x87
-// loads, and SSE / AVX / AVX-512 instructions whose ModRM.reg names a vector register. What the instruction does with the general
-// register named by ModRM.reg decides whether it may share the base register: a load's destination may (its new value is kept), a
-// register read as a value may not (it would see the moved pointer, and so would the flags).
-enum class Role { kNone, kDest, kDestPartial, kSrc, kSrcDest };
+// loads and stores, SSE / AVX / AVX-512 instructions whose ModRM.reg names a vector register (loads and stores), and stores and
+// read-modify-writes of memory (mov m, r / imm; op m, r / imm; inc, dec, not, neg, shifts; setcc; xchg, xadd, cmpxchg; movnti).
+// What the instruction does with the general register named by ModRM.reg decides whether it may share the base register: a load's
+// destination may (its new value is kept), a register only stored may (the write is dropped), a register read as a value may not (it
+// would see the moved pointer, and so would the flags). An instruction that uses rax or rcx without naming it (cmpxchg, shifts by
+// cl) is refused when that register is the base.
+enum class Role { kNone, kDest, kDestPartial, kSrc, kSrcDest, kStore };   // kStore: ModRM.reg only stored to memory
 
 struct Operand {
     int base = -1;      // the memory operand's base register (0..15), -1: can't be redirected
     int reg = -1;       // the general register ModRM.reg names (0..15), -1 if it names none
     Role role = Role::kNone;
+    bool writes = false; // a general-purpose instruction that writes memory (a lock prefix is allowed only on those)
 };
 
 bool vector_op_map1(uint8_t op, bool p66, bool pf3) {   // 0F xx (legacy SSE, VEX map 1, EVEX map 1): ModRM.reg is a vector register
@@ -84,21 +91,21 @@ bool vector_op_map1(uint8_t op, bool p66, bool pf3) {   // 0F xx (legacy SSE, VE
         return true;
     if (op >= 0x51 && op <= 0x6f) return true;
     if (op == 0x70 || op == 0x74 || op == 0x75 || op == 0x76 || op == 0xc2 || op == 0xc4 || op == 0xc6 || op == 0xe6) return true;
-    if (op == 0x7e) return pf3 && !p66;   // movq xmm, m64 (the other 7E forms store)
-    if (op >= 0xd1 && op <= 0xfe) return op != 0xd6 && op != 0xd7 && op != 0xe7 && op != 0xf7;   // stores, masks, maskmov
+    if (op == 0x11 || op == 0x13 || op == 0x17 || op == 0x29 || op == 0x2b || op == 0x7e || op == 0x7f) return true;   // and stores
+    if (op >= 0xd1 && op <= 0xfe) return op != 0xd7 && op != 0xf7;   // not pmovmskb (no memory), maskmov (writes at rdi)
     return false;
 }
 
 Operand decode_operand(const uint8_t* ip) {
     Operand o;
     int i = 0;
-    bool p66 = false, pf2 = false, pf3 = false;
+    bool p66 = false, pf2 = false, pf3 = false, lock = false;
     for (; i < 15; ++i) {   // legacy prefixes
         const uint8_t b = ip[i];
         if (b == 0x66) { p66 = true; continue; }
         if (b == 0xf2) { pf2 = true; continue; }
         if (b == 0xf3) { pf3 = true; continue; }
-        if (b == 0xf0) return o;   // lock: a write
+        if (b == 0xf0) { lock = true; continue; }
         if (b == 0x26 || b == 0x2e || b == 0x36 || b == 0x3e || b == 0x64 || b == 0x65 || b == 0x67) return o;   // segment / addr32
         break;
     }
@@ -152,7 +159,7 @@ Operand decode_operand(const uint8_t* ip) {
     const int reg = regf | (rex_r << 3);
     const bool p16 = p66 && !vex;   // operand size 16 for the general-register forms
     // Classify: is it allowed, and what is ModRM.reg to it?
-    bool byte_op = false;
+    bool byte_op = false, uses_rax = false, uses_rcx = false;
     if (map == 0) {
         if (op == 0x8b) o.role = p16 ? Role::kDestPartial : Role::kDest;
         else if (op == 0x8a) { o.role = Role::kDestPartial; byte_op = true; }
@@ -161,12 +168,26 @@ Operand decode_operand(const uint8_t* ip) {
         else if (op == 0x3a || op == 0x3b || op == 0x38 || op == 0x39 || op == 0x84 || op == 0x85) { o.role = Role::kSrc; byte_op = !(op & 1); }  // cmp / test
         else if ((op == 0x80 || op == 0x81 || op == 0x83) && regf == 7) o.role = Role::kNone;   // cmp m, imm
         else if ((op == 0xf6 || op == 0xf7) && regf <= 1) o.role = Role::kNone;                 // test m, imm
-        else if (op >= 0xd8 && op <= 0xdf) o.role = Role::kNone;                                // x87 (stores fault as writes)
+        else if (op >= 0xd8 && op <= 0xdf) o.role = Role::kNone;                                // x87 loads and stores
+        else if (op == 0x88 || op == 0x89) { o.role = Role::kStore; o.writes = true; byte_op = op == 0x88; }   // mov m, r
+        else if ((op == 0xc6 || op == 0xc7) && regf == 0) o.writes = true;                      // mov m, imm
+        else if (op < 0x40 && (op & 7) <= 1 && (op & 0x38) != 0x38) { o.role = Role::kSrc; o.writes = true; byte_op = !(op & 1); }  // add/or/adc/sbb/and/sub/xor m, r
+        else if (op == 0x80 || op == 0x81 || op == 0x83) o.writes = true;                        // the same, m, imm
+        else if ((op == 0xf6 || op == 0xf7) && (regf == 2 || regf == 3)) o.writes = true;       // not / neg m
+        else if ((op == 0xfe || op == 0xff) && regf <= 1) o.writes = true;                      // inc / dec m
+        else if (op == 0xc0 || op == 0xc1 || op == 0xd0 || op == 0xd1) { if (regf == 6) return o; o.writes = true; }   // shifts by imm / 1
+        else if (op == 0xd2 || op == 0xd3) { if (regf == 6) return o; o.writes = true; uses_rcx = true; }            // shifts by cl
+        else if (op == 0x86 || op == 0x87) { o.role = op == 0x86 || p16 ? Role::kDestPartial : Role::kDest; o.writes = true; byte_op = op == 0x86; }  // xchg: the register gets the 0
         else return o;
     } else if (!vex && map == 1) {
         if (opc == 0xb6 || opc == 0xb7 || opc == 0xbe || opc == 0xbf) o.role = p16 ? Role::kDestPartial : Role::kDest;
         else if ((opc >= 0x40 && opc <= 0x4f) || opc == 0xaf || opc == 0xbc || opc == 0xbd || (opc == 0xb8 && pf3)) o.role = Role::kSrcDest;
         else if ((opc == 0x2c || opc == 0x2d) && (pf2 || pf3)) o.role = Role::kDest;   // cvt(t)ss/sd2si r, m (no prefix: to MMX)
+        else if (opc >= 0x90 && opc <= 0x9f) o.writes = true;                                   // setcc m8
+        else if (opc == 0xc3) { o.role = Role::kStore; o.writes = true; }                       // movnti m, r
+        else if (opc == 0xc0 || opc == 0xc1) { o.role = opc == 0xc0 || p16 ? Role::kDestPartial : Role::kDest; o.writes = true; byte_op = opc == 0xc0; }  // xadd: the register gets the old 0
+        else if (opc == 0xb0 || opc == 0xb1) { o.role = Role::kStore; o.writes = true; uses_rax = true; byte_op = opc == 0xb0; }  // cmpxchg: rax gets the 0 when they differ
+        else if (opc == 0xba && regf >= 4) o.writes = regf > 4;                                 // bt / bts / btr / btc m, imm
         else if (vector_op_map1(opc, p66, pf3)) o.role = Role::kNone;
         else return o;
     } else if (map == 1) {   // VEX / EVEX map 1
@@ -175,9 +196,10 @@ Operand decode_operand(const uint8_t* ip) {
         else return o;
     } else if (map == 2) {
         if (opc >= 0xf0) return o;   // movbe / crc32 / BMI: general registers
+        if (opc >= 0xa0 && opc <= 0xa3) return o;   // scatters: their lanes can land anywhere
         o.role = Role::kNone;
     } else if (map == 3) {
-        if (opc == 0xf0 || (opc >= 0x14 && opc <= 0x17) || opc == 0x1d || (opc >= 0x60 && opc <= 0x63)) return o;   // rorx; extracts store; pcmp[ei]str[im] use rax/rcx/rdx
+        if (opc == 0xf0 || (opc >= 0x60 && opc <= 0x63)) return o;   // rorx; pcmp[ei]str[im] use rax/rcx/rdx
         o.role = Role::kNone;
     } else {
         return o;
@@ -200,7 +222,9 @@ Operand decode_operand(const uint8_t* ip) {
         if (index != 4 && index == b) return o; // [r + r*s]: moving it moves both
     }
     if (b == 4) return o;                   // rsp: never
-    if (o.reg == b && o.role != Role::kDest) return o;   // the base register read as a value, or partly overwritten: refuse
+    if (o.reg == b && o.role != Role::kDest && o.role != Role::kStore) return o;   // the base read as a value, or partly overwritten
+    if ((uses_rax && b == 0) || (uses_rcx && b == 1)) return o;   // the instruction uses the base register without naming it
+    if (lock && !o.writes) return o;        // lock on anything else: not one of ours
     o.base = b;
     return o;
 }
@@ -215,8 +239,11 @@ DWORD64* context_register(CONTEXT* c, int r) {
     }
 }
 
-uint8_t* g_zero = nullptr;   // 128 KiB read-only zeros; loads are pointed at its middle
-constexpr uint64_t kZeroHalf = 0x10000;
+// Per guest thread, made at its first redirect: 128 KiB of zeros, accesses are pointed at its middle. After each redirected
+// instruction the bytes around the middle are zeroed again (a write is dropped), so every read through it sees 0; being the thread's
+// own, no other thread's write can show through. Kept for the thread's life (a thread that exits leaves its 128 KiB behind).
+thread_local uint8_t* t_sink = nullptr;
+constexpr uint64_t kSinkHalf = 0x10000, kSinkWipe = 0x1000;   // wiped: kSinkWipe on each side of the middle
 
 // Lifted code only: the function containing the faulting instruction (its unwind entry) must start at a registered lifted
 // function (a leaf with no unwind entry: a lifted function must start within 16 KiB below it). The snapshot of their host addresses is rebuilt by the log thread whenever more are registered.
@@ -260,6 +287,8 @@ struct Redirect {
 };
 thread_local Redirect t_redirect;
 
+void wipe_sink() { std::memset(t_sink + kSinkHalf - kSinkWipe, 0, 2 * kSinkWipe); }
+
 // One logged line per guest instruction answered by a redirect (they can repeat every frame), in their own table.
 constexpr int kRipSet = 8192, kMaxRedirectLogs = 1024;
 std::atomic<uint64_t> g_rips[kRipSet];
@@ -276,21 +305,25 @@ bool first_time_rip(uint64_t rip) {
 Entry g_redirect_logs[kMaxRedirectLogs];
 std::atomic<int> g_redirect_used{0};
 
-LONG redirect_read(EXCEPTION_POINTERS* ep, uint64_t addr) {
+LONG redirect(EXCEPTION_POINTERS* ep, uint64_t addr, bool write) {
     CONTEXT* c = ep->ContextRecord;
     const uint64_t rip = static_cast<uint64_t>(c->Rip);
-    if (!g_zero || t_redirect.active || !in_lifted_code(rip)) return EXCEPTION_CONTINUE_SEARCH;
+    if (t_redirect.active || !in_lifted_code(rip)) return EXCEPTION_CONTINUE_SEARCH;
     if (addr >= kLow && vm_query(addr & ~uint64_t(0xfff)).state != kMemFree) return EXCEPTION_CONTINUE_SEARCH;   // the guest's own
     const Operand o = decode_operand(reinterpret_cast<const uint8_t*>(rip));
     DWORD64* r = o.base >= 0 ? context_register(c, o.base) : nullptr;
     if (!r) return EXCEPTION_CONTINUE_SEARCH;
-    const uint64_t target = reinterpret_cast<uint64_t>(g_zero) + kZeroHalf;
+    if (!t_sink) {
+        t_sink = static_cast<uint8_t*>(VirtualAlloc(nullptr, 2 * kSinkHalf, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        if (!t_sink) return EXCEPTION_CONTINUE_SEARCH;
+    }
+    const uint64_t target = reinterpret_cast<uint64_t>(t_sink) + kSinkHalf;
     t_redirect.active = true;
     t_redirect.reg = o.base;
     t_redirect.keep = o.reg == o.base;   // only kDest gets here with reg == base
     t_redirect.orig = *r;
     t_redirect.rip = rip;
-    *r = *r + (target - addr);   // the operand's address becomes the zero block's middle (± the access width)
+    *r = *r + (target - addr);   // the operand's address becomes the block's middle (± the access width)
     c->EFlags |= 0x100;          // trap flag: the single-step after this one instruction puts the register back
     if (first_time_rip(rip)) {
         const int slot = g_redirect_used.fetch_add(1, std::memory_order_relaxed);
@@ -299,6 +332,7 @@ LONG redirect_read(EXCEPTION_POINTERS* ep, uint64_t addr) {
             e.addr = addr;
             e.rip = rip;
             e.redirected = true;
+            e.write = write;
             e.ready.store(true, std::memory_order_release);
         }
     }
@@ -314,6 +348,7 @@ LONG single_step(EXCEPTION_POINTERS* ep) {
     if (r && !t.keep) *r = t.orig;   // the instruction did not write the base register: give it back its value
     c->EFlags &= ~DWORD(0x100);
     t.active = false;
+    wipe_sink();                     // what a write put there is dropped
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 
@@ -328,6 +363,7 @@ void abandon_redirect(EXCEPTION_POINTERS* ep) {
         c->EFlags &= ~DWORD(0x100);
     }
     t.active = false;
+    wipe_sink();
 }
 
 LONG CALLBACK on_fault(EXCEPTION_POINTERS* ep) {
@@ -339,12 +375,12 @@ LONG CALLBACK on_fault(EXCEPTION_POINTERS* ep) {
     const ULONG_PTR kind = er->ExceptionInformation[0];   // 0 read, 1 write, 8 execute
     const uint64_t addr = er->ExceptionInformation[1];
     if ((kind != 0 && kind != 1) || addr >= kHigh || !kernel::current_ctx()) return EXCEPTION_CONTINUE_SEARCH;
-    if (addr < kLow) return kind == 0 ? redirect_read(ep, addr) : EXCEPTION_CONTINUE_SEARCH;   // the null page area can't be mapped
+    if (addr < kLow) return redirect(ep, addr, kind == 1);   // the null page area can't be mapped
     const uint64_t granule = addr & ~(kGranule - 1);
     MEMORY_BASIC_INFORMATION mbi{};
     if (!VirtualQuery(reinterpret_cast<void*>(granule), &mbi, sizeof mbi)) return EXCEPTION_CONTINUE_SEARCH;
     if (mbi.State != MEM_FREE || reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize < granule + kGranule)
-        return kind == 0 ? redirect_read(ep, addr) : EXCEPTION_CONTINUE_SEARCH;   // not wholly free (a host reservation): redirect a read
+        return redirect(ep, addr, kind == 1);   // not wholly free (a host reservation): can't map either
     if (vm_query(granule).state != kMemFree) return EXCEPTION_CONTINUE_SEARCH;
     const int slot = g_used.fetch_add(1, std::memory_order_relaxed);
     if (slot >= kMaxGranules) return EXCEPTION_CONTINUE_SEARCH;
@@ -370,9 +406,10 @@ void log_entry(const Entry& e) {
     NXLOG_W(kTag, "unmapped %s at 0x%llx (guest function f_%llx): answered as the emulators do, %s ([memory] unmapped_access = zero; "
             "a broken mod table is the usual cause)", e.write ? "write" : "read", static_cast<unsigned long long>(e.addr),
             static_cast<unsigned long long>(fn),
-            e.write        ? "the write kept in zeroed memory mapped there"
-            : e.redirected ? "it reads 0 (that instruction is pointed at zeros each time; logged once)"
-                           : "it reads 0");
+            e.redirected ? (e.write ? "the write is dropped (that instruction is pointed at scratch zeros each time; logged once)"
+                                    : "it reads 0 (that instruction is pointed at zeros each time; logged once)")
+            : e.write    ? "the write kept in zeroed memory mapped there"
+                         : "it reads 0");
 }
 
 void log_thread() {
@@ -424,8 +461,6 @@ void unmapped_install() {
         NXLOG_I(kTag, "unmapped guest accesses crash ([memory] unmapped_access = crash)");
         return;
     }
-    g_zero = static_cast<uint8_t*>(VirtualAlloc(nullptr, 2 * kZeroHalf, MEM_RESERVE | MEM_COMMIT, PAGE_READONLY));
-    if (!g_zero) NXLOG_W(kTag, "unmapped guest accesses: no zero block: reads of the null page area and host reservations crash");
     g_veh = AddVectoredExceptionHandler(0, on_fault);
     if (!g_veh) {
         NXLOG_W(kTag, "unmapped guest accesses: no exception handler: they crash");
