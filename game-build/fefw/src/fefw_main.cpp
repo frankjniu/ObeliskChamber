@@ -11,7 +11,7 @@
 //        [--build-pipelines [--force] [--threads N] [--status FILE]]
 // --build-pipelines (S1, [boot] build_pipelines): no game runs. The graphics device starts as for play (a hidden window), every pipeline of
 // the player's own key file is built into the pipeline cache on most of the cores, the cache is written and the process ends (exit 0, 1 on
-// an error, 3 when stopped). Progress on stdout and in a status file (fefw_build_pipelines.h); the launcher runs it before play.
+// an error, 5 when stopped). Progress on stdout and in a status file (fefw_build_pipelines.h); the launcher runs it before play.
 // The dump is read where it is, nothing is copied: [fs] exefs (the update's ExeFS folder), [fs] main (main as an uncompressed NSO: the
 // console's main is ZBIC-compressed, which the runtime's NSO loader cannot read), [fs] romfs (the extracted RomFS folder). Their defaults
 // are set by the build (fefw_paths.h). The ini is --ini, else NXRT_INI, else ObeliskChamber.ini in the working directory when it exists, else nxrt.ini.
@@ -44,6 +44,7 @@
 #include "nxrt/input_source.h"
 #include "nxrt/kernel.h"
 #include "nxrt/log.h"
+#include "nxrt/memguard.h"
 #include "nxrt/memory.h"
 #include "nxrt/module.h"
 #include "nxrt/nvn.h"
@@ -351,44 +352,83 @@ void say_build(const std::string& line) {
     NXLOG_I("boot", "%s", line.c_str());
 }
 
+// Exit codes of --build-pipelines (the launcher reads the status file; these are for a console). 3 and 4 are the memory guard's and the
+// crash handler's, so "stopped" has a code of its own.
+constexpr int kBuildOk = 0, kBuildError = 1, kBuildStopped = 5;
+
 // [boot] build_pipelines: the graphics device as play makes it (a hidden window, so the same GPU is picked and the same device features are
-// on), the NVN back end without the game's entry points, then nxrt::nvn::build_pipelines, then an orderly end. controls.ini is read first
-// (play::load), as play reads it before the first pipeline: its display choices ([nvn] keys, HDR) shape some shader variants.
-int build_pipelines_mode() {
+// on; headless with [gfx] headless / [boot] gfx = headless, or when the windowed device cannot start), the NVN back end without the game's
+// entry points, then nxrt::nvn::build_pipelines, then an orderly end. controls.ini is read first (play::load), as play reads it before the
+// first pipeline: its display choices ([nvn] keys, HDR) shape some shader variants. Every way out tears down, runs nxrt::shutdown (the
+// memory guard's and the watchdog's threads would otherwise end the process through std::terminate and a crash report) and ends the
+// process with TerminateProcess, as play does.
+[[noreturn]] void build_pipelines_mode() {
     const std::string status_path = nxrt::config_get_str("boot", "build_pipelines_status", "pipeline_build.txt");
     const std::filesystem::path stop_path = std::filesystem::u8path(status_path + ".stop");
     std::error_code ec;
     std::filesystem::remove(stop_path, ec);                     // a request left from an earlier run is not this run's
     fefw_build::Status st;
     write_build_status(status_path, st);
+    bool window = false, backend = false;
+    auto finish = [&](int code) {
+        std::error_code e2;
+        std::filesystem::remove(stop_path, e2);
+        NXLOG_I("boot", "build-pipelines: peak memory %.0f MiB (private commit, memory guard)", static_cast<double>(nxrt::memguard_peak()) / (1024.0 * 1024.0));
+        nxrt::log_flush();
+        if (backend) nxrt::nvn::shutdown_backend();
+        g_gfx_device.reset();
+        if (window) nxrt::platform::destroy_window();
+        nxrt::platform::shutdown();
+        nxrt::shutdown();
+        nxrt::log_flush();
+        TerminateProcess(GetCurrentProcess(), static_cast<UINT>(code));
+        for (;;) Sleep(1000);
+    };
     auto fail = [&](const std::string& why) {
         st.state = "error";
         st.message = why;
         write_build_status(status_path, st);
         say_build(fefw_build::end_line(st));
-        nxrt::log_flush();
-        return 1;
+        finish(kBuildError);
     };
-    if (!nxrt::config_get_bool("boot", "nvn", true) || nxrt::config_get_str("boot", "gfx", "window") == "none")
-        return fail("[boot] nvn is off or [boot] gfx is none: there is no graphics device to build pipelines with");
+    if (!nxrt::config_get_bool("boot", "nvn", true)) fail("[boot] nvn is off: there is no graphics device to build pipelines with");
+    const std::string gfxmode = nxrt::config_get_str("boot", "gfx", nxrt::config_get_bool("gfx", "headless", false) ? "headless" : "window");
+    if (gfxmode == "none") fail("[boot] gfx is none: there is no graphics device to build pipelines with");
+    if (nxrt::config_get_str("nvn", "pipeline_cache", "pipeline_cache.bin").empty())
+        fail("[nvn] pipeline_cache is empty: there is no pipeline cache file to build into");
     nxrt::play::load();
-    nxrt::platform::init();
-    nxrt::platform::WindowDesc wd;
-    wd.title = nxrt::game::info().title;
-    wd.width = 320;
-    wd.height = 180;
-    wd.hidden = true;
-    const bool window = nxrt::platform::create_window(wd);
-    if (!window) NXLOG_W("boot", "build-pipelines: no window could be made: the device starts headless (on a PC with two GPUs it may pick another one)");
-    nxrt::gfx::DeviceDesc dd;
-    dd.headless = window ? 0 : 1;
     std::string err;
-    g_gfx_device = nxrt::gfx::Device::create(dd, &err);
-    if (!g_gfx_device) return fail("graphics device: " + err);
+    if (gfxmode == "window") {
+        nxrt::platform::init();
+        nxrt::platform::WindowDesc wd;
+        wd.title = nxrt::game::info().title;
+        wd.width = 320;
+        wd.height = 180;
+        wd.hidden = true;
+        window = nxrt::platform::create_window(wd);
+        if (!window) NXLOG_W("boot", "build-pipelines: no window could be made: the device starts headless (on a PC with two GPUs it may pick another one)");
+        else {
+            nxrt::gfx::DeviceDesc dd;
+            dd.headless = 0;
+            g_gfx_device = nxrt::gfx::Device::create(dd, &err);
+            if (!g_gfx_device) {
+                NXLOG_W("boot", "build-pipelines: the windowed device did not start (%s): trying headless", err.c_str());
+                nxrt::platform::destroy_window();
+                window = false;
+            }
+        }
+    }
+    if (!g_gfx_device) {
+        nxrt::gfx::DeviceDesc dd;
+        dd.headless = 1;
+        g_gfx_device = nxrt::gfx::Device::create(dd, &err);
+        if (!g_gfx_device) fail("graphics device: " + err);
+    }
     nxrt::nvn::BackendDesc bd;
     bd.device = g_gfx_device.get();
     bd.register_entry_points = false;
-    if (!nxrt::nvn::install_backend(bd)) return fail("the NVN back end failed to start (see the log)");
+    if (!nxrt::nvn::install_backend(bd)) fail("the NVN back end failed to start (see the log)");
+    backend = true;
     st.gpu = g_gfx_device->gpu().name;
 
     nxrt::nvn::PipelineBuildOptions o;
@@ -428,34 +468,23 @@ int build_pipelines_mode() {
     st.threads = r.threads;
     st.identity = r.identity;
     if (!r.gpu.empty()) st.gpu = r.gpu;
-    int code = 0;
-    if (!ok) {
-        code = fail(r.error.empty() ? "the pipelines could not be built (see the log)" : r.error);
-    } else {
-        st.done = r.built + r.failed;
-        st.total = r.todo;
-        st.built = r.built;
-        st.failed = r.failed;
-        st.seconds = r.seconds;
-        st.median_ms = r.median_ms;
-        st.state = r.already_ready ? "ready" : r.cancelled ? "stopped" : "done";
-        st.message = r.already_ready ? (r.keys ? "every recorded pipeline is already built for this GPU and driver" : "no pipelines are recorded yet: play first")
-                     : r.cancelled   ? "stopped: what was built is kept"
-                     : r.failed      ? std::to_string(r.failed) + " pipelines could not be built (" + std::to_string(r.missing_shaders) +
-                                      " without a usable shader in the cache); the game builds those when it needs them"
-                                     : "";
-        write_build_status(status_path, st);
-        say_build(fefw_build::end_line(st));
-        code = r.cancelled ? 3 : 0;
-    }
-    std::filesystem::remove(stop_path, ec);
-    nxrt::log_flush();
-    nxrt::nvn::shutdown_backend();
-    g_gfx_device.reset();
-    if (window) nxrt::platform::destroy_window();
-    nxrt::platform::shutdown();
-    nxrt::log_flush();
-    return code;
+    if (!ok) fail(r.error.empty() ? "the pipelines could not be built (see the log)" : r.error);
+    st.done = r.built + r.failed;
+    st.total = r.todo;
+    st.built = r.built;
+    st.failed = r.failed;
+    st.seconds = r.seconds;
+    st.median_ms = r.median_ms;
+    st.state = r.already_ready ? "ready" : r.cancelled ? "stopped" : "done";
+    st.message = r.already_ready ? (r.keys ? "every recorded pipeline is already built for this GPU and driver" : "no pipelines are recorded yet: play first")
+                 : r.cancelled   ? "stopped: what was built is kept"
+                 : r.failed      ? std::to_string(r.failed) + " pipelines could not be built (" + std::to_string(r.missing_shaders) +
+                                  " without a usable shader in the cache); the game builds those when it needs them"
+                                 : "";
+    write_build_status(status_path, st);
+    say_build(fefw_build::end_line(st));
+    finish(r.cancelled ? kBuildStopped : kBuildOk);
+    for (;;) Sleep(1000);                                       // finish ends the process
 }
 
 int fefw_run(int argc, char** argv) {
@@ -499,7 +528,7 @@ int fefw_run(int argc, char** argv) {
     const std::string main_nso = fs_path("main", main_arg, FEFW_MAIN_DEFAULT);
     const std::string romfs = fs_path("romfs", romfs_arg, FEFW_ROMFS_DEFAULT);
     nxrt::config_set("process", "program_id", "0x04007EF01F8AE000");     // GetInfo(ProgramId); an ini value or the environment still wins
-    if (nxrt::config_get_bool("boot", "build_pipelines", false)) return build_pipelines_mode();   // no game: the pipelines, then the end
+    if (nxrt::config_get_bool("boot", "build_pipelines", false)) build_pipelines_mode();   // no game: the pipelines, then the end (does not return)
     // the complete RomFS of update 131072 (base and update merged): 252,686 files. Dumps well short of it crash at boot (#64: 157,847 is the
     // base game's RomFS, 221,339 a partial copy); services/fs.cpp names the cause in the crash report. 0 turns the check off.
     if (!nxrt::config_has("fs", "romfs_files")) nxrt::config_set("fs", "romfs_files", "252686");
