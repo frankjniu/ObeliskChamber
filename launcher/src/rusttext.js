@@ -78,6 +78,8 @@ export function statusText(s) {
   if (x) return t('play.buildDone', { built: x[1], seconds: x[2] });
   x = /^Pipelines built: (\d+) in (\d+) s \((\d+) could not be built\)\.$/.exec(m);
   if (x) return t('play.buildDoneFailed', { built: x[1], seconds: x[2], failed: x[3] });
+  x = /^The pipeline build ended without a result \(exit code (-?\d+|none)\)\. See (.+)\.$/.exec(m);
+  if (x) return t('play.buildNoResult', { code: x[1], log: x[2] });
   x = /^The pipeline build failed: (.*)$/.exec(m);
   if (x) return t('play.buildFailed', { error: x[1] });
   return m;

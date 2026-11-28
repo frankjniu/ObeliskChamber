@@ -76,6 +76,7 @@ export const zh = {
     'play.buildReady': "管线已为此显卡和驱动构建完毕。",
     'play.buildStopped': "管线构建已停止；已构建的部分会保留。",
     'play.buildFailed': "管线构建失败：{error}",
+    'play.buildNoResult': "管线构建没有结果就结束了（退出代码 {code}）。请查看 {log}。",
     'settings.buildPipelines.label': "游戏前构建管线",
     'settings.buildPipelines.hint': "在需要时（首次、Set up 之后、显卡驱动更新之后，或上次游戏发现驱动缓存是冷的），开始游戏前先构建之前记录的管线，显示进度条和跳过按钮。其他情况下直接开始游戏。",
     'play.exited': '已退出，{code}',

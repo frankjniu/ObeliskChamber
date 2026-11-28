@@ -147,6 +147,7 @@
     "play.buildReady": "",
     "play.buildStopped": "",
     "play.buildFailed": "",
+    "play.buildNoResult": "",
     "settings.buildPipelines.label": "",
     "settings.buildPipelines.hint": "",
     "setup.title": "",

@@ -51,8 +51,11 @@ struct Config {
     lighting_edit: bool,
     /// "Build pipelines before play" (pipelines.rs, S1): Play first builds the recorded pipelines when a build is due. Off unless ticked.
     build_pipelines: bool,
-    /// The graphics drivers the last finished pipeline build ran with (pipelines::driver_fingerprint; Windows only).
+    /// The graphics drivers the last pipeline build that ended ran with (pipelines::driver_fingerprint; Windows only). Kept after a build
+    /// that failed too, so a failing build is not started again at every Play until something changes.
     pipelines_driver: String,
+    /// pipelines::log_stamp of the ObeliskChamber.log a build was last started for (one build per cold session).
+    pipelines_cold_log: u64,
 }
 
 fn config_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -512,7 +515,7 @@ fn play(app: AppHandle, state: State<Arc<setup::Shared>>) -> Result<(), String> 
     settings::ensure_play_paths(&p.game_dir, &p)?;
     if cfg.build_pipelines {
         let driver = pipelines::driver_fingerprint();
-        let why = pipelines::reasons(&p.game_dir, &p.exe(), &cfg.pipelines_driver, driver.as_deref());
+        let why = pipelines::reasons(&p.game_dir, &p.exe(), &cfg.pipelines_driver, driver.as_deref(), cfg.pipelines_cold_log);
         if !why.is_empty() {
             return start_pipeline_build(&app, &p, &cfg, driver, false, Some(cfg.minimize_on_play));
         }
@@ -523,14 +526,18 @@ fn play(app: AppHandle, state: State<Arc<setup::Shared>>) -> Result<(), String> 
 /// Runs ObeliskChamber.exe --build-pipelines (pipelines.rs); a finished build remembers the drivers it ran with.
 fn start_pipeline_build(app: &AppHandle, p: &setup::Paths, cfg: &Config, driver: Option<String>, force: bool, play_after: Option<bool>) -> Result<(), String> {
     let app2 = app.clone();
-    let remember = Box::new(move |_: &pipelines::BuildStatus| {
-        if let Some(d) = driver {
-            let mut c = load_config(&app2);
-            if c.pipelines_driver != d {
-                c.pipelines_driver = d;
-                if let (Ok(text), Ok(path)) = (serde_json::to_string_pretty(&c), config_path(&app2)) {
-                    let _ = settings::write_atomic(&path, &text);
-                }
+    let log_seen = pipelines::log_stamp(&p.game_dir);
+    let remember = Box::new(move |st: &pipelines::BuildStatus| {
+        let mut c = load_config(&app2);
+        let before = (c.pipelines_driver.clone(), c.pipelines_cold_log);
+        c.pipelines_cold_log = log_seen;
+        // a skipped build is resumed at the next Play (pipelines::reasons); one that ended (done, ready, or an error) is for these drivers
+        if let Some(d) = driver.filter(|_| st.state != "stopped") {
+            c.pipelines_driver = d;
+        }
+        if (c.pipelines_driver.clone(), c.pipelines_cold_log) != before {
+            if let (Ok(text), Ok(path)) = (serde_json::to_string_pretty(&c), config_path(&app2)) {
+                let _ = settings::write_atomic(&path, &text);
             }
         }
     });

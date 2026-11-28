@@ -78,6 +78,7 @@ export const en = {
     'play.buildReady': "Pipelines are already built for this GPU and driver.",
     'play.buildStopped': "The pipeline build stopped; what was built is kept.",
     'play.buildFailed': "The pipeline build failed: {error}",
+    'play.buildNoResult': "The pipeline build ended without a result (exit code {code}). See {log}.",
     'settings.buildPipelines.label': "Build pipelines before play",
     'settings.buildPipelines.hint': "Play first builds the pipelines your earlier sessions recorded, with a progress bar and a Skip button, when it is due: the first time, after Set up, after a graphics driver update, or when the last session found the driver cache cold. Otherwise Play starts the game at once.",
     'play.exited': 'Exited, {code}',

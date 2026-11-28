@@ -155,17 +155,27 @@ pub fn driver_fingerprint() -> Option<String> {
     parse_driver_versions(&String::from_utf8_lossy(&out.stdout))
 }
 
-/// Why a build is due before play (empty: it is not). `last_driver`: the fingerprint stored after the last finished build; `driver_now`:
-/// driver_fingerprint().
-pub fn reasons(dir: &Path, exe: &Path, last_driver: &str, driver_now: Option<&str>) -> Vec<String> {
+/// When the run folder's ObeliskChamber.log was last written (seconds since 1970; 0: none): the launcher keeps the one a build was started
+/// for, so one cold session starts one build.
+pub fn log_stamp(dir: &Path) -> u64 {
+    mtime(&dir.join(GAME_LOG)).and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs())
+}
+
+/// Why a build is due before play (empty: it is not). `last_driver`: the fingerprint stored after the last build that ended (done, ready
+/// or error); `driver_now`: driver_fingerprint(); `cold_log_seen`: the log_stamp a build was last started for.
+pub fn reasons(dir: &Path, exe: &Path, last_driver: &str, driver_now: Option<&str>, cold_log_seen: u64) -> Vec<String> {
     let mut v = Vec::new();
     if !has_keys(dir) {
         return v; // nothing recorded yet: play records, the next start builds
     }
-    let (Some(_), Some(built_at)) = (read_status(dir), mtime(&dir.join(STATUS_FILE))) else {
+    let (Some(last), Some(built_at)) = (read_status(dir), mtime(&dir.join(STATUS_FILE))) else {
         v.push("no pipeline build yet".to_string());
         return v;
     };
+    // a build the player skipped goes on at the next Play (it keeps what it built and builds the rest)
+    if last.state == "stopped" || last.state == "running" || last.state == "starting" {
+        v.push("the last build did not finish".to_string());
+    }
     if mtime(exe).is_some_and(|t| t > built_at) {
         v.push("Set up ran since the last build".to_string());
     }
@@ -174,8 +184,10 @@ pub fn reasons(dir: &Path, exe: &Path, last_driver: &str, driver_now: Option<&st
             v.push("the graphics driver changed".to_string());
         }
     }
+    // A cold session after the last build, once per log. Not after a build that found nothing to do: that build cannot warm what the
+    // session found cold (the exe's own check is the authority), and asking again would start a build at every Play.
     let log = dir.join(GAME_LOG);
-    if mtime(&log).is_some_and(|t| t > built_at) && cold_in_log(&log_head(&log)) {
+    if last.state != "ready" && log_stamp(dir) != cold_log_seen && mtime(&log).is_some_and(|t| t > built_at) && cold_in_log(&log_head(&log)) {
         v.push("the last session found the driver's cache cold".to_string());
     }
     v
@@ -197,6 +209,9 @@ fn outcome(st: &BuildStatus, skipped: bool, code: Option<i32>) -> String {
         "done" => format!("Pipelines built: {} in {:.0} s.", st.built, st.seconds),
         "ready" => "Pipelines are already built for this GPU and driver.".to_string(),
         "stopped" => "The pipeline build stopped; what was built is kept.".to_string(),
+        "error" if st.message.starts_with("ended without a result") => {
+            format!("The pipeline build ended without a result (exit code {}). See {LOG_FILE}.", code.map_or("none".to_string(), |c| c.to_string()))
+        }
         "error" => format!("The pipeline build failed: {}", st.message),
         _ if skipped => "The pipeline build stopped; what was built is kept.".to_string(),
         _ => format!("The pipeline build ended without a result (exit code {}). See {LOG_FILE}.", code.map_or("none".to_string(), |c| c.to_string())),
@@ -204,7 +219,8 @@ fn outcome(st: &BuildStatus, skipped: bool, code: Option<i32>) -> String {
 }
 
 /// Starts the build. `play_after`: Some(minimize) starts the game when it ends, whatever the outcome (a build that failed or was skipped
-/// leaves the game to build what it needs, as before). `remember` runs after a build that finished (done or ready).
+/// leaves the game to build what it needs, as before). `remember` runs when it has ended, with its final status (state done, ready,
+/// stopped or error).
 #[allow(clippy::too_many_arguments)]
 pub fn start(
     app: &AppHandle,
@@ -278,9 +294,17 @@ pub fn start(
             }
         };
         let _ = std::fs::remove_file(&stop_path);
-        if st.state == "done" || st.state == "ready" {
-            remember(&st);
+        let mut st = st;
+        if st.state.is_empty() || st.state == "starting" || st.state == "running" {
+            // ended without a result of its own (it crashed, or Skip had to end it): the file says so, so that the next Play does not
+            // start it again unless something changes (a skip is resumed: reasons())
+            st.state = if skipped { "stopped".into() } else { "error".into() };
+            if st.message.is_empty() {
+                st.message = format!("ended without a result (exit code {})", code.map_or("none".to_string(), |c| c.to_string()));
+            }
+            let _ = std::fs::write(&status_path, format!("state: {}\ndone: {}\ntotal: {}\nmessage: {}\n", st.state, st.done, st.total, st.message));
         }
+        remember(&st);
         let message = outcome(&st, skipped, code);
         play::set_status(&app, Status { state: "idle".into(), message: message.clone(), ..Default::default() });
         if let Some(minimize) = play_after {
@@ -335,23 +359,45 @@ mod tests {
         let exe = dir.join("ObeliskChamber.exe");
         std::fs::write(&exe, b"exe").unwrap();
         // no key file: nothing to build
-        assert!(reasons(&dir, &exe, "", Some("1")).is_empty());
+        assert!(reasons(&dir, &exe, "", Some("1"), 0).is_empty());
         std::fs::write(dir.join("pipeline_keys.bin"), vec![0u8; 16 + 200]).unwrap();
-        assert_eq!(reasons(&dir, &exe, "", None), ["no pipeline build yet"]);
+        assert_eq!(reasons(&dir, &exe, "", None, 0), ["no pipeline build yet"]);
         std::thread::sleep(Duration::from_millis(20));
         std::fs::write(dir.join(STATUS_FILE), "state: done\n").unwrap();
-        assert!(reasons(&dir, &exe, "1", Some("1")).is_empty());
-        assert_eq!(reasons(&dir, &exe, "1", Some("2")), ["the graphics driver changed"]);
-        // a session after the build that found the cache cold
+        assert!(reasons(&dir, &exe, "1", Some("1"), 0).is_empty());
+        assert_eq!(reasons(&dir, &exe, "1", Some("2"), 0), ["the graphics driver changed"]);
+        // a failed build is not retried by itself; a skipped one is resumed
+        std::fs::write(dir.join(STATUS_FILE), "state: error\nmessage: x\n").unwrap();
+        assert!(reasons(&dir, &exe, "1", Some("1"), 0).is_empty());
+        std::fs::write(dir.join(STATUS_FILE), "state: stopped\n").unwrap();
+        assert_eq!(reasons(&dir, &exe, "1", Some("1"), 0), ["the last build did not finish"]);
+        std::fs::write(dir.join(STATUS_FILE), "state: done\n").unwrap();
+        // a session after the build that found the cache cold: once per log, and not after a build that had nothing to do
         std::thread::sleep(Duration::from_millis(20));
         std::fs::write(dir.join(GAME_LOG), "x: the driver's cache is cold (a new driver)\n").unwrap();
-        assert_eq!(reasons(&dir, &exe, "1", Some("1")), ["the last session found the driver's cache cold"]);
+        assert_eq!(reasons(&dir, &exe, "1", Some("1"), 0), ["the last session found the driver's cache cold"]);
+        assert!(reasons(&dir, &exe, "1", Some("1"), log_stamp(&dir)).is_empty());
         // Set up made a new exe
         std::fs::write(&exe, b"exe 2").unwrap();
-        assert!(reasons(&dir, &exe, "1", Some("1")).contains(&"Set up ran since the last build".to_string()));
+        assert!(reasons(&dir, &exe, "1", Some("1"), 0).contains(&"Set up ran since the last build".to_string()));
         // [nvn] pipeline_keys elsewhere, with nothing in it
         std::fs::write(dir.join("ObeliskChamber.ini"), "[nvn]\npipeline_keys = keys/other.bin\n").unwrap();
-        assert!(reasons(&dir, &exe, "1", Some("1")).is_empty());
+        assert!(reasons(&dir, &exe, "1", Some("1"), 0).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_ready_build_does_not_answer_a_cold_log() {
+        let dir = std::env::temp_dir().join(format!("fefw_pipelines_ready_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("ObeliskChamber.exe");
+        std::fs::write(&exe, b"exe").unwrap();
+        std::fs::write(dir.join("pipeline_keys.bin"), vec![0u8; 16 + 200]).unwrap();
+        std::fs::write(dir.join(STATUS_FILE), "state: ready\n").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(dir.join(GAME_LOG), "x: the driver's cache is cold (a new driver)\n").unwrap();
+        assert!(reasons(&dir, &exe, "1", Some("1"), 0).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
